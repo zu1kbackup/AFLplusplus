@@ -325,12 +325,6 @@ void load_stats_file(afl_state_t *afl) {
 
       }
 
-      if (key_matches("max_depth", keystring)) {
-
-        afl->max_depth = strtoul(lptr, &nptr, 10);
-
-      }
-
       if (key_matches("saved_crashes", keystring)) {
 
         afl->saved_crashes = strtoull(lptr, &nptr, 10);

@@ -1914,14 +1914,8 @@ void pivot_inputs(afl_state_t *afl) {
           afl->file_extension ? (const char *)afl->file_extension : "");
 
       /* Since we're at it, let's also get the parent and figure out the
-         appropriate depth for this entry. */
-
-      /* A local parent is only recorded as "id:N,src:M,...", i.e. ",src:" has
-         to directly follow the ID. Do not take the first ':' after "id": for
-         seeds ("id:N,time:0,execs:0,orig:name") that is the one of "time:" and
-         would make every seed a child of entry 0. Synced entries
-         ("id:N,sync:fuzzer,src:M") are left alone as well, M is an ID of the
-         other fuzzer's queue. */
+         appropriate depth for this entry. Only "id:N,src:M,..." names carry a
+         local parent; seeds and synced entries have none. */
 
       src_str = strncmp(rsl, CASE_PREFIX, 3) ? NULL : strchr(rsl + 3, ',');
 

@@ -3364,6 +3364,8 @@ void afl_load_seeds(afl_state_t *afl) {
     u32                 q_len = o_end - o_start;
     struct queue_entry *q;
 
+    afl->max_depth = 0;
+
     for (u32 i = 0; i < afl->queued_items; i++) {
 
       q = afl->queue_buf[i];
@@ -3385,6 +3387,8 @@ void afl_load_seeds(afl_state_t *afl) {
       afl->total_bitmap_size += q->bitmap_size;
       ++afl->total_bitmap_entries;
       update_bitmap_score(afl, q, false);
+
+      if (q->depth > afl->max_depth) { afl->max_depth = q->depth; }
 
       if (q->was_fuzzed) { --afl->pending_not_fuzzed; }
 
