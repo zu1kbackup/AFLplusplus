@@ -5,18 +5,20 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                     Heiko Eißfeldt <heiko.eissfeldt@hexco.de>,
+                     Heiko Eissfeldt <heiko.eissfeldt@hexco.de>,
                      Andrea Fioraldi <andreafioraldi@gmail.com>,
                      Dominik Maier <mail@dmnk.co>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2026 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
 
-     http://www.apache.org/licenses/LICENSE-2.0
+     https://www.apache.org/licenses/LICENSE-2.0
+
+   SPDX-License-Identifier: Apache-2.0
 
  */
 
@@ -24,6 +26,8 @@
 #define _HAVE_DEBUG_H
 
 #include <errno.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include "types.h"
 #include "config.h"
@@ -32,9 +36,9 @@
  * Terminal colors *
  *******************/
 
-#ifndef MESSAGES_TO_STDOUT
-  #define MESSAGES_TO_STDOUT
-#endif
+/* Define MESSAGES_TO_STDOUT to send diagnostic messages to stdout.
+   By default, messages go to stderr (correct Unix convention).
+   afl-fuzz defines this in afl-fuzz.h for its TUI. */
 
 #ifdef USE_COLOR
 
@@ -116,7 +120,7 @@
  * Box drawing sequences *
  *************************/
 
-#ifdef FANCY_BOXES
+#ifdef FANCY_BOXES_NO_UTF
 
   #define SET_G1 "\x1b)0"                      /* Set G1 for box drawing    */
   #define RESET_G1 "\x1b)B"                    /* Reset G1 to ASCII         */
@@ -136,22 +140,43 @@
 
 #else
 
-  #define SET_G1 ""
-  #define RESET_G1 ""
-  #define bSTART ""
-  #define bSTOP ""
-  #define bH "-"
-  #define bV "|"
-  #define bLT "+"
-  #define bRT "+"
-  #define bLB "+"
-  #define bRB "+"
-  #define bX "+"
-  #define bVR "+"
-  #define bVL "+"
-  #define bHT "+"
-  #define bHB "+"
+  #ifdef FANCY_BOXES
 
+    #define SET_G1 ""
+    #define RESET_G1 ""
+    #define bSTART ""
+    #define bSTOP ""
+    #define bH "\u2500"                        /* Horizontal line           */
+    #define bV "\u2502"                        /* Vertical line             */
+    #define bLT "\u250c"                       /* Left top corner           */
+    #define bRT "\u2510"                       /* Right top corner          */
+    #define bLB "\u2514"                       /* Left bottom corner        */
+    #define bRB "\u2518"                       /* Right bottom corner       */
+    #define bX "\u253c"                        /* Cross                     */
+    #define bVR "\u251c"                       /* Vertical, branch right    */
+    #define bVL "\u2524"                       /* Vertical, branch left     */
+    #define bHT "\u2534"                       /* Horizontal, branch top    */
+    #define bHB "\u252c"                       /* Horizontal, branch bottom */
+
+  #else
+
+    #define SET_G1 ""
+    #define RESET_G1 ""
+    #define bSTART ""
+    #define bSTOP ""
+    #define bH "-"
+    #define bV "|"
+    #define bLT "+"
+    #define bRT "+"
+    #define bLB "+"
+    #define bRB "+"
+    #define bX "+"
+    #define bVR "+"
+    #define bVL "+"
+    #define bHT "+"
+    #define bHB "+"
+
+  #endif
 #endif                                                      /* ^FANCY_BOXES */
 
 /***********************
@@ -192,7 +217,7 @@ static inline const char *colorfilter(const char *x) {
   if (likely(disabled)) return x;
 
   static char monochromestring[4096];
-  char *      d = monochromestring;
+  char       *d = monochromestring;
   int         in_seq = 0;
 
   while (*x) {
@@ -293,11 +318,26 @@ static inline const char *colorfilter(const char *x) {
 #define FATAL(x...)                                                      \
   do {                                                                   \
                                                                          \
-    SAYF(bSTOP RESET_G1 CURSOR_SHOW cRST cLRD                            \
-         "\n[-] PROGRAM ABORT : " cRST   x);                               \
+    SAYF(bSTOP RESET_G1 CURSOR_SHOW    cRST cLRD                         \
+         "\n[-] PROGRAM ABORT : " cRST x);                               \
     SAYF(cLRD "\n         Location : " cRST "%s(), %s:%u\n\n", __func__, \
          __FILE__, (u32)__LINE__);                                       \
     exit(1);                                                             \
+                                                                         \
+  } while (0)
+
+/* Die like FATAL(), but without running the exit handlers. For a forked child
+   that must not tear down state its parent still owns. */
+
+#define CFATAL(x...)                                                     \
+  do {                                                                   \
+                                                                         \
+    SAYF(bSTOP RESET_G1 CURSOR_SHOW    cRST cLRD                         \
+         "\n[-] PROGRAM ABORT : " cRST x);                               \
+    SAYF(cLRD "\n         Location : " cRST "%s(), %s:%u\n\n", __func__, \
+         __FILE__, (u32)__LINE__);                                       \
+    fflush(NULL);                                                        \
+    _exit(1);                                                            \
                                                                          \
   } while (0)
 
@@ -306,10 +346,11 @@ static inline const char *colorfilter(const char *x) {
 #define ABORT(x...)                                                      \
   do {                                                                   \
                                                                          \
-    SAYF(bSTOP RESET_G1 CURSOR_SHOW cRST cLRD                            \
-         "\n[-] PROGRAM ABORT : " cRST   x);                               \
+    SAYF(bSTOP RESET_G1 CURSOR_SHOW    cRST cLRD                         \
+         "\n[-] PROGRAM ABORT : " cRST x);                               \
     SAYF(cLRD "\n    Stop location : " cRST "%s(), %s:%u\n\n", __func__, \
          __FILE__, (u32)__LINE__);                                       \
+    fflush(stdout);                                                      \
     abort();                                                             \
                                                                          \
   } while (0)
@@ -320,12 +361,29 @@ static inline const char *colorfilter(const char *x) {
   do {                                                                 \
                                                                        \
     fflush(stdout);                                                    \
-    SAYF(bSTOP RESET_G1 CURSOR_SHOW cRST cLRD                          \
-         "\n[-]  SYSTEM ERROR : " cRST   x);                             \
+    SAYF(bSTOP RESET_G1 CURSOR_SHOW    cRST cLRD                       \
+         "\n[-]  SYSTEM ERROR : " cRST x);                             \
     SAYF(cLRD "\n    Stop location : " cRST "%s(), %s:%u\n", __func__, \
          __FILE__, (u32)__LINE__);                                     \
     SAYF(cLRD "       OS message : " cRST "%s\n", strerror(errno));    \
     exit(1);                                                           \
+                                                                       \
+  } while (0)
+
+/* Die like PFATAL(), but without running the exit handlers. For a forked child
+   that must not tear down state its parent still owns. */
+
+#define PCFATAL(x...)                                                  \
+  do {                                                                 \
+                                                                       \
+    fflush(stdout);                                                    \
+    SAYF(bSTOP RESET_G1 CURSOR_SHOW    cRST cLRD                       \
+         "\n[-]  SYSTEM ERROR : " cRST x);                             \
+    SAYF(cLRD "\n    Stop location : " cRST "%s(), %s:%u\n", __func__, \
+         __FILE__, (u32)__LINE__);                                     \
+    SAYF(cLRD "       OS message : " cRST "%s\n", strerror(errno));    \
+    fflush(NULL);                                                      \
+    _exit(1);                                                          \
                                                                        \
   } while (0)
 
@@ -355,29 +413,96 @@ static inline const char *colorfilter(const char *x) {
 /* Error-checking versions of read() and write() that call RPFATAL() as
    appropriate. */
 
-#define ck_write(fd, buf, len, fn)                                        \
-  do {                                                                    \
-                                                                          \
-    int _fd = (fd);                                                       \
-                                                                          \
-    s32 _len = (s32)(len);                                                \
-    s32 _res = write(_fd, (buf), _len);                                   \
-    if (_res != _len) {                                                   \
-                                                                          \
-      RPFATAL(_res, "Short write to %s, fd %d (%d of %d bytes)", fn, _fd, \
-              _res, _len);                                                \
-                                                                          \
-    }                                                                     \
-                                                                          \
+#define ck_write(fd, buf, len, fn)                                            \
+  do {                                                                        \
+                                                                              \
+    if (len <= 0) break;                                                      \
+    int _fd = (fd);                                                           \
+    s32 _written = 0, _off = 0, _len = (s32)(len);                            \
+                                                                              \
+    do {                                                                      \
+                                                                              \
+      s32 _res = write(_fd, (buf) + _off, _len);                              \
+      if (_res != _len && (_res > 0 && _written + _res != _len)) {            \
+                                                                              \
+        if (_res > 0) {                                                       \
+                                                                              \
+          _written += _res;                                                   \
+          _len -= _res;                                                       \
+          _off += _res;                                                       \
+                                                                              \
+        } else {                                                              \
+                                                                              \
+          RPFATAL(_res, "Short write to %s, fd %d (%d of %d bytes)", fn, _fd, \
+                  _res, _len);                                                \
+                                                                              \
+        }                                                                     \
+                                                                              \
+      } else {                                                                \
+                                                                              \
+        break;                                                                \
+                                                                              \
+      }                                                                       \
+                                                                              \
+    } while (1);                                                              \
+                                                                              \
+                                                                              \
+                                                                              \
   } while (0)
 
-#define ck_read(fd, buf, len, fn)                              \
-  do {                                                         \
-                                                               \
-    s32 _len = (s32)(len);                                     \
-    s32 _res = read(fd, buf, _len);                            \
-    if (_res != _len) RPFATAL(_res, "Short read from %s", fn); \
-                                                               \
+#define ck_read(fd, buf, len, fn)                                              \
+  do {                                                                         \
+                                                                               \
+    s32 _len = (s32)(len);                                                     \
+    /* PERFORMANCE: Disable debug checks as requested by reviewer */           \
+    _Pragma("GCC diagnostic push")                                             \
+        _Pragma("GCC diagnostic ignored \"-Wunused-variable\"") if (0) {       \
+                                                                               \
+      fprintf(stderr, "[DEBUG ck_read] %s: expecting %d bytes, fd=%d\n", fn,   \
+              _len, fd);                                                       \
+                                                                               \
+    }                                                                          \
+    /* DEBUG: Add file size check for IJON debugging */                        \
+    if (0) {                                                                   \
+                                                                               \
+      struct stat _st;                                                         \
+      if (fstat(fd, &_st) == 0) {                                              \
+                                                                               \
+        fprintf(stderr, "[DEBUG ck_read] %s: actual file size is %ld bytes\n", \
+                fn, (long)_st.st_size);                                        \
+        if (_st.st_size != _len) {                                             \
+                                                                               \
+          fprintf(stderr,                                                      \
+                  "[DEBUG ck_read] %s: FILE SIZE MISMATCH! Queue says %d "     \
+                  "bytes, file has %ld bytes\n",                               \
+                  fn, _len, (long)_st.st_size);                                \
+                                                                               \
+        }                                                                      \
+                                                                               \
+      }                                                                        \
+                                                                               \
+    }                                                                          \
+    _Pragma("GCC diagnostic pop") s32 _res = read(fd, buf, _len);              \
+    if (0) {                                                                   \
+                                                                               \
+      fprintf(stderr, "[DEBUG ck_read] %s: got %d bytes (expected %d)\n", fn,  \
+              _res, _len);                                                     \
+                                                                               \
+    }                                                                          \
+    if (unlikely(_res != _len)) {                                              \
+                                                                               \
+      if (0) {                                                                 \
+                                                                               \
+        fprintf(stderr,                                                        \
+                "[DEBUG ck_read] %s: SHORT READ! Expected %d, got %d (diff: "  \
+                "%d)\n",                                                       \
+                fn, _len, _res, _len - _res);                                  \
+                                                                               \
+      }                                                                        \
+      RPFATAL(_res, "Short read from %s", fn);                                 \
+                                                                               \
+    }                                                                          \
+                                                                               \
   } while (0)
 
 #endif                                                   /* ! _HAVE_DEBUG_H */

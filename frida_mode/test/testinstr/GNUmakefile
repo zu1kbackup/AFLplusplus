@@ -18,6 +18,9 @@ all: $(TESTINSTBIN)
 32:
 	CFLAGS="-m32" LDFLAGS="-m32" ARCH="x86" make all
 
+arm:
+	CFLAGS="-marm" LDFLAGS="-marm" CC="arm-linux-gnueabihf-gcc" CXX="arm-linux-gnueabihf-g++" make $(TESTINSTBIN)
+
 $(BUILD_DIR):
 	mkdir -p $@
 
@@ -64,3 +67,8 @@ debug:
 		--ex 'set environment LD_PRELOAD=$(ROOT)afl-frida-trace.so' \
 		--ex 'set disassembly-flavor intel' \
 		--args $(TESTINSTBIN) $(TESTINSTR_DATA_FILE)
+
+lldb:
+	lldb \
+		-O 'settings set target.env-vars DYLD_INSERT_LIBRARIES=$(ROOT)afl-frida-trace.so' \
+		-- $(TESTINSTBIN) $(TESTINSTR_DATA_FILE)

@@ -10,6 +10,18 @@
 [submodule "custom_mutators/gramatron/json-c"]
 	path = custom_mutators/gramatron/json-c
 	url = https://github.com/json-c/json-c
-[submodule "utils/optimin/EvalMaxSAT"]
-	path = utils/optimin/EvalMaxSAT
-	url = https://github.com/FlorentAvellaneda/EvalMaxSAT
+[submodule "coresight_mode/coresight-trace"]
+	path = coresight_mode/coresight-trace
+	url = https://github.com/AFLplusplus/coresight-trace.git
+[submodule "nyx_mode/libnyx"]
+	path = nyx_mode/libnyx
+	url = https://github.com/nyx-fuzz/libnyx.git
+[submodule "nyx_mode/packer"]
+	path = nyx_mode/packer
+	url = https://github.com/nyx-fuzz/packer.git
+[submodule "nyx_mode/QEMU-Nyx"]
+	path = nyx_mode/QEMU-Nyx
+	url = https://github.com/nyx-fuzz/QEMU-Nyx
+[submodule "qemu_bridge/qemu-libafl-bridge"]
+	path = qemu_bridge/qemu-libafl-bridge
+	url = https://github.com/AFLplusplus/qemu-libafl-bridge

@@ -20,7 +20,7 @@
 //! This binding is panic-safe in that it will prevent panics from unwinding into AFL++. Any panic will `abort` at the boundary between the custom mutator and AFL++.
 //!
 //! # Access to AFL++ internals
-//! This crate has an optional feature "afl_internals", which gives access to AFL++'s internal state.
+//! This crate has an optional feature "`afl_internals`", which gives access to AFL++'s internal state.
 //! The state is passed to [`CustomMutator::init`], when the feature is activated.
 //!
 //! _This is completely unsafe and uses automatically generated types extracted from the AFL++ source._
@@ -28,7 +28,7 @@ use std::{fmt::Debug, path::Path};
 
 #[cfg(feature = "afl_internals")]
 #[doc(hidden)]
-pub use custom_mutator_sys::afl_state;
+pub use custom_mutator_sys::{afl_state, queue_entry};
 
 #[allow(unused_variables)]
 #[doc(hidden)]
@@ -73,6 +73,8 @@ pub trait RawCustomMutator {
         None
     }
 
+    fn post_process<'b, 's: 'b>(&'s mut self, buffer: &'b mut [u8]) -> Option<&'b [u8]>;
+
     /*fn post_process(&self, buffer: &[u8], unsigned char **out_buf)-> usize;
     int afl_custom_init_trim(&self, buffer: &[u8]);
     size_t afl_custom_trim(&self, unsigned char **out_buf);
@@ -85,12 +87,9 @@ pub trait RawCustomMutator {
 /// These wrappers are not intended to be used directly, rather export_mutator will use them to publish the custom mutator C API.
 #[doc(hidden)]
 pub mod wrappers {
-    #[cfg(feature = "afl_internals")]
-    use custom_mutator_sys::afl_state;
-
     use std::{
         any::Any,
-        ffi::{c_void, CStr, OsStr},
+        ffi::{CStr, OsStr, c_void},
         mem::ManuallyDrop,
         os::{raw::c_char, unix::ffi::OsStrExt},
         panic::catch_unwind,
@@ -99,6 +98,9 @@ pub mod wrappers {
         ptr::null,
         slice,
     };
+
+    #[cfg(feature = "afl_internals")]
+    use custom_mutator_sys::afl_state;
 
     use crate::RawCustomMutator;
 
@@ -115,7 +117,7 @@ pub mod wrappers {
     impl<M: RawCustomMutator> FFIContext<M> {
         fn from(ptr: *mut c_void) -> ManuallyDrop<Box<Self>> {
             assert!(!ptr.is_null());
-            ManuallyDrop::new(unsafe { Box::from_raw(ptr as *mut Self) })
+            ManuallyDrop::new(unsafe { Box::from_raw(ptr.cast::<Self>()) })
         }
 
         fn into_ptr(self: Box<Self>) -> *const c_void {
@@ -141,27 +143,28 @@ pub mod wrappers {
     }
 
     /// panic handler called for every panic
-    fn panic_handler(method: &str, panic_info: Box<dyn Any + Send + 'static>) -> ! {
+    fn panic_handler(method: &str, panic_info: &Box<dyn Any + Send + 'static>) -> ! {
         use std::ops::Deref;
-        let cause = panic_info
-            .downcast_ref::<String>()
-            .map(String::deref)
-            .unwrap_or_else(|| {
+        let cause = panic_info.downcast_ref::<String>().map_or_else(
+            || {
                 panic_info
                     .downcast_ref::<&str>()
                     .copied()
                     .unwrap_or("<cause unknown>")
-            });
-        eprintln!("A panic occurred at {}: {}", method, cause);
+            },
+            String::deref,
+        );
+        eprintln!("A panic occurred at {method}: {cause}");
         abort()
     }
 
     /// Internal function used in the macro
     #[cfg(not(feature = "afl_internals"))]
+    #[must_use]
     pub fn afl_custom_init_<M: RawCustomMutator>(seed: u32) -> *const c_void {
         match catch_unwind(|| FFIContext::<M>::new(seed).into_ptr()) {
             Ok(ret) => ret,
-            Err(err) => panic_handler("afl_custom_init", err),
+            Err(err) => panic_handler("afl_custom_init", &err),
         }
     }
 
@@ -176,7 +179,7 @@ pub mod wrappers {
             FFIContext::<M>::new(afl, seed).into_ptr()
         }) {
             Ok(ret) => ret,
-            Err(err) => panic_handler("afl_custom_init", err),
+            Err(err) => panic_handler("afl_custom_init", &err),
         }
     }
 
@@ -194,34 +197,31 @@ pub mod wrappers {
         add_buf_size: usize,
         max_size: usize,
     ) -> usize {
-        match catch_unwind(|| {
-            let mut context = FFIContext::<M>::from(data);
-            if buf.is_null() {
-                panic!("null buf passed to afl_custom_fuzz")
-            }
-            if out_buf.is_null() {
-                panic!("null out_buf passed to afl_custom_fuzz")
-            }
-            let buff_slice = slice::from_raw_parts_mut(buf, buf_size);
-            let add_buff_slice = if add_buf.is_null() {
-                None
-            } else {
-                Some(slice::from_raw_parts(add_buf, add_buf_size))
-            };
-            match context.mutator.fuzz(buff_slice, add_buff_slice, max_size) {
-                Some(buffer) => {
+        unsafe {
+            match catch_unwind(|| {
+                let mut context = FFIContext::<M>::from(data);
+
+                assert!(!buf.is_null(), "null buf passed to afl_custom_fuzz");
+                assert!(!out_buf.is_null(), "null out_buf passed to afl_custom_fuzz");
+
+                let buff_slice = slice::from_raw_parts_mut(buf, buf_size);
+                let add_buff_slice = if add_buf.is_null() {
+                    None
+                } else {
+                    Some(slice::from_raw_parts(add_buf, add_buf_size))
+                };
+                if let Some(buffer) = context.mutator.fuzz(buff_slice, add_buff_slice, max_size) {
                     *out_buf = buffer.as_ptr();
                     buffer.len()
-                }
-                None => {
+                } else {
                     // return the input buffer with 0-length to let AFL skip this mutation attempt
                     *out_buf = buf;
                     0
                 }
+            }) {
+                Ok(ret) => ret,
+                Err(err) => panic_handler("afl_custom_fuzz", &err),
             }
-        }) {
-            Ok(ret) => ret,
-            Err(err) => panic_handler("afl_custom_fuzz", err),
         }
     }
 
@@ -235,49 +235,52 @@ pub mod wrappers {
         buf: *const u8,
         buf_size: usize,
     ) -> u32 {
-        match catch_unwind(|| {
-            let mut context = FFIContext::<M>::from(data);
-            if buf.is_null() {
-                panic!("null buf passed to afl_custom_fuzz")
+        unsafe {
+            match catch_unwind(|| {
+                let mut context = FFIContext::<M>::from(data);
+                assert!(!buf.is_null(), "null buf passed to afl_custom_fuzz");
+
+                let buf_slice = slice::from_raw_parts(buf, buf_size);
+                // see https://doc.rust-lang.org/nomicon/borrow-splitting.html
+                let ctx = &mut **context;
+                let mutator = &mut ctx.mutator;
+                mutator.fuzz_count(buf_slice)
+            }) {
+                Ok(ret) => ret,
+                Err(err) => panic_handler("afl_custom_fuzz_count", &err),
             }
-            let buf_slice = slice::from_raw_parts(buf, buf_size);
-            // see https://doc.rust-lang.org/nomicon/borrow-splitting.html
-            let ctx = &mut **context;
-            let mutator = &mut ctx.mutator;
-            mutator.fuzz_count(buf_slice)
-        }) {
-            Ok(ret) => ret,
-            Err(err) => panic_handler("afl_custom_fuzz_count", err),
         }
     }
 
     /// Internal function used in the macro
-    pub fn afl_custom_queue_new_entry_<M: RawCustomMutator>(
+    pub unsafe fn afl_custom_queue_new_entry_<M: RawCustomMutator>(
         data: *mut c_void,
         filename_new_queue: *const c_char,
         filename_orig_queue: *const c_char,
     ) -> bool {
         match catch_unwind(|| {
             let mut context = FFIContext::<M>::from(data);
-            if filename_new_queue.is_null() {
-                panic!("received null filename_new_queue in afl_custom_queue_new_entry");
-            }
+            assert!(
+                !filename_new_queue.is_null(),
+                "received null filename_new_queue in afl_custom_queue_new_entry"
+            );
+
             let filename_new_queue = Path::new(OsStr::from_bytes(
                 unsafe { CStr::from_ptr(filename_new_queue) }.to_bytes(),
             ));
-            let filename_orig_queue = if !filename_orig_queue.is_null() {
+            let filename_orig_queue = if filename_orig_queue.is_null() {
+                None
+            } else {
                 Some(Path::new(OsStr::from_bytes(
                     unsafe { CStr::from_ptr(filename_orig_queue) }.to_bytes(),
                 )))
-            } else {
-                None
             };
             context
                 .mutator
                 .queue_new_entry(filename_new_queue, filename_orig_queue)
         }) {
             Ok(ret) => ret,
-            Err(err) => panic_handler("afl_custom_queue_new_entry", err),
+            Err(err) => panic_handler("afl_custom_queue_new_entry", &err),
         }
     }
 
@@ -292,7 +295,7 @@ pub mod wrappers {
             ManuallyDrop::into_inner(FFIContext::<M>::from(data));
         }) {
             Ok(ret) => ret,
-            Err(err) => panic_handler("afl_custom_deinit", err),
+            Err(err) => panic_handler("afl_custom_deinit", &err),
         }
     }
 
@@ -306,13 +309,13 @@ pub mod wrappers {
                 buf.extend_from_slice(res.as_bytes());
                 buf.push(0);
                 // unwrapping here, as the error case should be extremely rare
-                CStr::from_bytes_with_nul(&buf).unwrap().as_ptr()
+                CStr::from_bytes_with_nul(buf).unwrap().as_ptr()
             } else {
                 null()
             }
         }) {
             Ok(ret) => ret,
-            Err(err) => panic_handler("afl_custom_introspection", err),
+            Err(err) => panic_handler("afl_custom_introspection", &err),
         }
     }
 
@@ -329,18 +332,18 @@ pub mod wrappers {
                 buf.extend_from_slice(res.as_bytes());
                 buf.push(0);
                 // unwrapping here, as the error case should be extremely rare
-                CStr::from_bytes_with_nul(&buf).unwrap().as_ptr()
+                CStr::from_bytes_with_nul(buf).unwrap().as_ptr()
             } else {
                 null()
             }
         }) {
             Ok(ret) => ret,
-            Err(err) => panic_handler("afl_custom_describe", err),
+            Err(err) => panic_handler("afl_custom_describe", &err),
         }
     }
 
     /// Internal function used in the macro
-    pub fn afl_custom_queue_get_<M: RawCustomMutator>(
+    pub unsafe fn afl_custom_queue_get_<M: RawCustomMutator>(
         data: *mut c_void,
         filename: *const c_char,
     ) -> u8 {
@@ -348,14 +351,73 @@ pub mod wrappers {
             let mut context = FFIContext::<M>::from(data);
             assert!(!filename.is_null());
 
-            context.mutator.queue_get(Path::new(OsStr::from_bytes(
+            u8::from(context.mutator.queue_get(Path::new(OsStr::from_bytes(
                 unsafe { CStr::from_ptr(filename) }.to_bytes(),
-            ))) as u8
+            ))))
         }) {
             Ok(ret) => ret,
-            Err(err) => panic_handler("afl_custom_queue_get", err),
+            Err(err) => panic_handler("afl_custom_queue_get", &err),
         }
     }
+
+    /// Internal function used in the macro
+    pub unsafe fn afl_custom_post_process<M: RawCustomMutator>(
+        data: *mut c_void,
+        buf: *mut u8,
+        buf_size: usize,
+        out_buf: *mut *const u8,
+    ) -> usize {
+        unsafe {
+            match catch_unwind(|| {
+                let mut context = FFIContext::<M>::from(data);
+
+                assert!(!buf.is_null(), "null buf passed to afl_custom_post_process");
+                assert!(
+                    !out_buf.is_null(),
+                    "null out_buf passed to afl_custom_post_process"
+                );
+                let buff_slice = slice::from_raw_parts_mut(buf, buf_size);
+                if let Some(buffer) = context.mutator.post_process(buff_slice) {
+                    *out_buf = buffer.as_ptr();
+                    return buffer.len();
+                }
+                0
+            }) {
+                Ok(ret) => ret,
+                Err(err) => panic_handler("afl_custom_post_process", &err),
+            }
+        }
+    }
+}
+
+/// An exported macro to defined afl_custom_init meant for insternal usage
+#[cfg(feature = "afl_internals")]
+#[macro_export]
+macro_rules! _define_afl_custom_init {
+    ($mutator_type:ty) => {
+        #[unsafe(no_mangle)]
+        pub extern "C" fn afl_custom_init(
+            afl: ::std::option::Option<&'static $crate::afl_state>,
+            seed: ::std::os::raw::c_uint,
+        ) -> *const ::std::os::raw::c_void {
+            $crate::wrappers::afl_custom_init_::<$mutator_type>(afl, seed as u32)
+        }
+    };
+}
+
+/// An exported macro to defined `afl_custom_init` meant for internal usage
+#[cfg(not(feature = "afl_internals"))]
+#[macro_export]
+macro_rules! _define_afl_custom_init {
+    ($mutator_type:ty) => {
+        #[unsafe(no_mangle)]
+        pub extern "C" fn afl_custom_init(
+            _afl: *const ::std::os::raw::c_void,
+            seed: ::std::os::raw::c_uint,
+        ) -> *const ::std::os::raw::c_void {
+            $crate::wrappers::afl_custom_init_::<$mutator_type>(seed as u32)
+        }
+    };
 }
 
 /// exports the given Mutator as a custom mutator as the C interface that AFL++ expects.
@@ -381,25 +443,9 @@ pub mod wrappers {
 #[macro_export]
 macro_rules! export_mutator {
     ($mutator_type:ty) => {
-        #[cfg(feature = "afl_internals")]
-        #[no_mangle]
-        pub extern "C" fn afl_custom_init(
-            afl: ::std::option::Option<&'static $crate::afl_state>,
-            seed: ::std::os::raw::c_uint,
-        ) -> *const ::std::os::raw::c_void {
-            $crate::wrappers::afl_custom_init_::<$mutator_type>(afl, seed as u32)
-        }
+        $crate::_define_afl_custom_init!($mutator_type);
 
-        #[cfg(not(feature = "afl_internals"))]
-        #[no_mangle]
-        pub extern "C" fn afl_custom_init(
-            _afl: *const ::std::os::raw::c_void,
-            seed: ::std::os::raw::c_uint,
-        ) -> *const ::std::os::raw::c_void {
-            $crate::wrappers::afl_custom_init_::<$mutator_type>(seed as u32)
-        }
-
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn afl_custom_fuzz_count(
             data: *mut ::std::os::raw::c_void,
             buf: *const u8,
@@ -408,7 +454,7 @@ macro_rules! export_mutator {
             $crate::wrappers::afl_custom_fuzz_count_::<$mutator_type>(data, buf, buf_size)
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn afl_custom_fuzz(
             data: *mut ::std::os::raw::c_void,
             buf: *mut u8,
@@ -429,8 +475,8 @@ macro_rules! export_mutator {
             )
         }
 
-        #[no_mangle]
-        pub extern "C" fn afl_custom_queue_new_entry(
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn afl_custom_queue_new_entry(
             data: *mut ::std::os::raw::c_void,
             filename_new_queue: *const ::std::os::raw::c_char,
             filename_orig_queue: *const ::std::os::raw::c_char,
@@ -442,22 +488,22 @@ macro_rules! export_mutator {
             )
         }
 
-        #[no_mangle]
-        pub extern "C" fn afl_custom_queue_get(
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn afl_custom_queue_get(
             data: *mut ::std::os::raw::c_void,
             filename: *const ::std::os::raw::c_char,
         ) -> u8 {
             $crate::wrappers::afl_custom_queue_get_::<$mutator_type>(data, filename)
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn afl_custom_introspection(
             data: *mut ::std::os::raw::c_void,
         ) -> *const ::std::os::raw::c_char {
             $crate::wrappers::afl_custom_introspection_::<$mutator_type>(data)
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn afl_custom_describe(
             data: *mut ::std::os::raw::c_void,
             max_description_len: usize,
@@ -465,9 +511,19 @@ macro_rules! export_mutator {
             $crate::wrappers::afl_custom_describe_::<$mutator_type>(data, max_description_len)
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn afl_custom_deinit(data: *mut ::std::os::raw::c_void) {
             $crate::wrappers::afl_custom_deinit_::<$mutator_type>(data)
+        }
+
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn afl_custom_post_process(
+            data: *mut ::std::os::raw::c_void,
+            buf: *mut u8,
+            buf_size: usize,
+            out_buf: *mut *const u8,
+        ) -> usize {
+            $crate::wrappers::afl_custom_post_process::<$mutator_type>(data, buf, buf_size, out_buf)
         }
     };
 }
@@ -477,8 +533,7 @@ macro_rules! export_mutator {
 mod sanity_test {
     #[cfg(feature = "afl_internals")]
     use super::afl_state;
-
-    use super::{export_mutator, RawCustomMutator};
+    use super::{RawCustomMutator, export_mutator};
 
     struct ExampleMutator;
 
@@ -501,14 +556,19 @@ mod sanity_test {
         ) -> Option<&'b [u8]> {
             unimplemented!()
         }
+
+        fn post_process<'b, 's: 'b>(&'s mut self, buffer: &'b mut [u8]) -> Option<&'b [u8]> {
+            unimplemented!()
+        }
     }
 
     export_mutator!(ExampleMutator);
 }
 
-#[allow(unused_variables)]
 /// A custom mutator.
 /// [`CustomMutator::handle_error`] will be called in case any method returns an [`Result::Err`].
+#[allow(unused_variables)]
+#[allow(clippy::missing_errors_doc)]
 pub trait CustomMutator {
     /// The error type. All methods must return the same error type.
     type Error: Debug;
@@ -523,7 +583,7 @@ pub trait CustomMutator {
             .map(|v| !v.is_empty())
             .unwrap_or(false)
         {
-            eprintln!("Error in custom mutator: {:?}", err)
+            eprintln!("Error in custom mutator: {err:?}");
         }
     }
 
@@ -566,6 +626,13 @@ pub trait CustomMutator {
 
     fn introspection(&mut self) -> Result<Option<&str>, Self::Error> {
         Ok(None)
+    }
+
+    fn post_process<'b, 's: 'b>(
+        &'s mut self,
+        buffer: &'b mut [u8],
+    ) -> Result<Option<&'b [u8]>, Self::Error> {
+        Ok(Some(buffer))
     }
 }
 
@@ -670,6 +737,16 @@ where
             }
         }
     }
+
+    fn post_process<'b, 's: 'b>(&'s mut self, buffer: &'b mut [u8]) -> Option<&'b [u8]> {
+        match self.post_process(buffer) {
+            Ok(r) => r,
+            Err(e) => {
+                Self::handle_error(e);
+                None
+            }
+        }
+    }
 }
 
 /// the default value to return from [`CustomMutator::describe`].
@@ -745,8 +822,7 @@ mod truncate_test {
             let actual_output = truncate_str_unicode_safe(input, *max_len);
             assert_eq!(
                 &actual_output, expected_output,
-                "{:#?} truncated to {} bytes should be {:#?}, but is {:#?}",
-                input, max_len, expected_output, actual_output
+                "{input:#?} truncated to {max_len} bytes should be {expected_output:#?}, but is {actual_output:#?}"
             );
         }
     }

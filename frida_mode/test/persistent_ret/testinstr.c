@@ -3,7 +3,7 @@
    --------------------------------------------------------
    Originally written by Michal Zalewski
    Copyright 2014 Google Inc. All rights reserved.
-   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
@@ -16,15 +16,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#ifdef __APPLE__
-  #define MAIN_SECTION
-#else
-  #define MAIN_SECTION __attribute__((section(".main")))
-#endif
-
 void LLVMFuzzerTestOneInput(char *buf, int len) {
 
-  printf (">>> LLVMFuzzerTestOneInput >>>\n");
+  printf(">>> LLVMFuzzerTestOneInput >>>\n");
   if (len < 1) return;
   buf[len] = 0;
 
@@ -44,12 +38,12 @@ void slow() {
 
 }
 
-MAIN_SECTION int main(int argc, char **argv) {
+int main(int argc, char **argv) {
 
-  char * file;
+  char  *file;
   int    fd = -1;
   off_t  len;
-  char * buf = NULL;
+  char  *buf = NULL;
   size_t n_read;
   int    result = -1;
 

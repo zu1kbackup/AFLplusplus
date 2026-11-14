@@ -5,21 +5,16 @@
    Written by Laszlo Szekeres <lszekeres@google.com> and
               Michal Zalewski
 
-   LLVM integration design comes from Laszlo Szekeres. C bits copied-and-pasted
-   from afl-as.c are Michal's fault.
-
    Copyright 2015, 2016 Google Inc. All rights reserved.
-   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2026 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
 
-     http://www.apache.org/licenses/LICENSE-2.0
+     https://www.apache.org/licenses/LICENSE-2.0
 
-   This library is plugged into LLVM when invoking clang through afl-clang-fast.
-   It tells the compiler to add code roughly equivalent to the bits discussed
-   in ../afl-as.h.
+   SPDX-License-Identifier: Apache-2.0
 
  */
 
@@ -43,9 +38,18 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+// #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#if defined(__has_include) && __has_include("llvm/Plugins/PassPlugin.h")
+  #include "llvm/Plugins/PassPlugin.h"
+#else
+  #include "llvm/Passes/PassPlugin.h"
+#endif
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/Passes/OptimizationLevel.h"
 
 #include "afl-llvm-common.h"
 
@@ -53,11 +57,10 @@ using namespace llvm;
 
 namespace {
 
-class AFLcheckIfInstrument : public ModulePass {
+class AFLcheckIfInstrument : public PassInfoMixin<AFLcheckIfInstrument> {
 
  public:
-  static char ID;
-  AFLcheckIfInstrument() : ModulePass(ID) {
+  AFLcheckIfInstrument() {
 
     if (getenv("AFL_DEBUG")) debug = 1;
 
@@ -65,12 +68,7 @@ class AFLcheckIfInstrument : public ModulePass {
 
   }
 
-  bool runOnModule(Module &M) override;
-
-  // StringRef getPassName() const override {
-
-  //  return "American Fuzzy Lop Instrumentation";
-  // }
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
 
  protected:
   std::list<std::string> myInstrumentList;
@@ -79,9 +77,31 @@ class AFLcheckIfInstrument : public ModulePass {
 
 }  // namespace
 
-char AFLcheckIfInstrument::ID = 0;
+extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
+llvmGetPassPluginInfo() {
 
-bool AFLcheckIfInstrument::runOnModule(Module &M) {
+  return {LLVM_PLUGIN_API_VERSION, "AFLcheckIfInstrument", "v0.1",
+          /* lambda to insert our pass into the pass pipeline. */
+          [](PassBuilder &PB) {
+
+            PB.registerOptimizerLastEPCallback([](ModulePassManager &MPM,
+                                                  OptimizationLevel  OL
+#if LLVM_VERSION_MAJOR >= 20
+                                                  ,
+                                                  ThinOrFullLTOPhase Phase
+#endif
+                                               ) {
+
+              MPM.addPass(AFLcheckIfInstrument());
+
+            });
+
+          }};
+
+}
+
+PreservedAnalyses AFLcheckIfInstrument::run(Module                &M,
+                                            ModuleAnalysisManager &MAM) {
 
   /* Show a banner */
 
@@ -102,7 +122,7 @@ bool AFLcheckIfInstrument::runOnModule(Module &M) {
 
     // fprintf(stderr, "F:%s\n", F.getName().str().c_str());
 
-    if (isInInstrumentList(&F)) {
+    if (isInInstrumentList(&F, MNAME)) {
 
       if (debug)
         DEBUGF("function %s is in the instrument file list\n",
@@ -114,33 +134,17 @@ bool AFLcheckIfInstrument::runOnModule(Module &M) {
         DEBUGF("function %s is NOT in the instrument file list\n",
                F.getName().str().c_str());
 
-      auto &        Ctx = F.getContext();
+      auto         &Ctx = F.getContext();
       AttributeList Attrs = F.getAttributes();
-      AttrBuilder   NewAttrs;
-      NewAttrs.addAttribute("skipinstrument");
-      F.setAttributes(
-          Attrs.addAttributes(Ctx, AttributeList::FunctionIndex, NewAttrs));
+      AttributeList NewAttrs = Attrs.addFnAttribute(Ctx, "skipinstrument");
+      F.setAttributes(NewAttrs);
 
     }
 
   }
 
-  return true;
+  auto PA = PreservedAnalyses::all();
+  return PA;
 
 }
-
-static void registerAFLcheckIfInstrumentpass(const PassManagerBuilder &,
-                                             legacy::PassManagerBase &PM) {
-
-  PM.add(new AFLcheckIfInstrument());
-
-}
-
-static RegisterStandardPasses RegisterAFLcheckIfInstrumentpass(
-    PassManagerBuilder::EP_ModuleOptimizerEarly,
-    registerAFLcheckIfInstrumentpass);
-
-static RegisterStandardPasses RegisterAFLcheckIfInstrumentpass0(
-    PassManagerBuilder::EP_EnabledOnOptLevel0,
-    registerAFLcheckIfInstrumentpass);
 

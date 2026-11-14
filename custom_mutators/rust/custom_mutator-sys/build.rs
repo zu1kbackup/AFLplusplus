@@ -1,7 +1,6 @@
 extern crate bindgen;
 
-use std::env;
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 // this code is largely taken straight from the handbook: https://github.com/fitzgen/bindgen-tutorial-bzip2-sys
 fn main() {
@@ -15,8 +14,8 @@ fn main() {
         // The input header we would like to generate
         // bindings for.
         .header("wrapper.h")
-        .whitelist_type("afl_state_t")
-        .blacklist_type(r"u\d+")
+        .allowlist_type("afl_state_t")
+        .blocklist_type(r"u\d+")
         .opaque_type(r"_.*")
         .opaque_type("FILE")
         .opaque_type("in_addr(_t)?")

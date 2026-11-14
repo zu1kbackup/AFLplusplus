@@ -1,5 +1,5 @@
 /*******************************************************************************
-Copyright (c) 2019-2020, Andrea Fioraldi
+Copyright (c) 2019-2024, Andrea Fioraldi
 
 
 Redistribution and use in source and binary forms, with or without
@@ -51,7 +51,7 @@ typedef struct {
 struct chunk_begin {
 
   size_t              requested_size;
-  void *              aligned_orig;  // NULL if not aligned
+  void               *aligned_orig;  // NULL if not aligned
   struct chunk_begin *next;
   struct chunk_begin *prev;
   char                redzone[REDZONE_SIZE];
@@ -80,8 +80,8 @@ static unsigned char __tmp_alloc_zone[TMP_ZONE_SIZE];
 #else
 
 // From dlmalloc.c
-void *                    dlmalloc(size_t);
-void                      dlfree(void *);
+void *dlmalloc(size_t);
+void  dlfree(void *);
   #define backend_malloc dlmalloc
   #define backend_free dlfree
 
@@ -306,9 +306,7 @@ int __libqasan_posix_memalign(void **ptr, size_t align, size_t len) {
 
   }
 
-  size_t rem = len % align;
-  size_t size = len;
-  if (rem) size += rem;
+  size_t size = len + align;
 
   int state = QASAN_SWAP(QASAN_DISABLED);  // disable qasan for this thread
 

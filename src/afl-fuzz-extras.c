@@ -5,17 +5,19 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
+                        Heiko Eissfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2026 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
 
-     http://www.apache.org/licenses/LICENSE-2.0
+     https://www.apache.org/licenses/LICENSE-2.0
+
+   SPDX-License-Identifier: Apache-2.0
 
    This is the real deal: the program takes an instrumented binary and
    attempts a variety of basic fuzzing tricks, paying close attention to
@@ -57,7 +59,7 @@ void load_extras_file(afl_state_t *afl, u8 *fname, u32 *min_len, u32 *max_len,
 
   FILE *f;
   u8    buf[MAX_LINE];
-  u8 *  lptr;
+  u8   *lptr;
   u32   cur_line = 0;
 
   u8 val_bufs[2][STRINGIFY_VAL_SIZE_MAX];
@@ -176,6 +178,8 @@ void load_extras_file(afl_state_t *afl, u8 *fname, u32 *min_len, u32 *max_len,
     afl->extras =
         afl_realloc((void **)&afl->extras,
                     (afl->extras_cnt + 1) * sizeof(struct extra_data));
+    char *hexdigits = "0123456789abcdef";
+
     if (unlikely(!afl->extras)) { PFATAL("alloc"); }
 
     wptr = afl->extras[afl->extras_cnt].data = ck_alloc(rptr - lptr);
@@ -184,13 +188,12 @@ void load_extras_file(afl_state_t *afl, u8 *fname, u32 *min_len, u32 *max_len,
 
     while (*lptr) {
 
-      char *hexdigits = "0123456789abcdef";
-
       switch (*lptr) {
 
         case 1 ... 31:
         case 128 ... 255:
           WARNF("Non-printable characters in line %u.", cur_line);
+          ++lptr;
           continue;
           break;
 
@@ -231,12 +234,27 @@ void load_extras_file(afl_state_t *afl, u8 *fname, u32 *min_len, u32 *max_len,
 
     afl->extras[afl->extras_cnt].len = klen;
 
+    /* Invalid characters and escapes are dropped above, so a keyword made only
+       of such characters ends up empty. Do not keep it as a zero-length token:
+       it is useless and only wastes executions in the insertion stages. */
+
+    if (!klen) {
+
+      WARNF("Empty keyword in line %u (no valid characters).", cur_line);
+      ck_free(afl->extras[afl->extras_cnt].data);
+      afl->extras[afl->extras_cnt].data = NULL;
+      continue;
+
+    }
+
     if (afl->extras[afl->extras_cnt].len > MAX_DICT_FILE) {
 
       WARNF(
           "Keyword too big in line %u (%s, limit is %s)", cur_line,
           stringify_mem_size(val_bufs[0], sizeof(val_bufs[0]), klen),
           stringify_mem_size(val_bufs[1], sizeof(val_bufs[1]), MAX_DICT_FILE));
+      ck_free(afl->extras[afl->extras_cnt].data);
+      afl->extras[afl->extras_cnt].data = NULL;
       continue;
 
     }
@@ -291,16 +309,32 @@ static void extras_check_and_sort(afl_state_t *afl, u32 min_len, u32 max_len,
 
 void load_extras(afl_state_t *afl, u8 *dir) {
 
-  DIR *          d;
+  DIR           *d;
   struct dirent *de;
   u32            min_len = MAX_DICT_FILE, max_len = 0, dict_level = 0;
-  u8 *           x;
+  u8            *x;
 
   u8 val_bufs[2][STRINGIFY_VAL_SIZE_MAX];
 
-  /* If the name ends with @, extract level and continue. */
+  /* If the name ends with @<level>, extract level and continue. Only the last
+     '@' counts, and only if nothing but digits follows it, so that a path may
+     contain '@' elsewhere (e.g. /home/user@host/words.dict). */
 
-  if ((x = strchr(dir, '@'))) {
+  if ((x = strrchr(dir, '@'))) {
+
+    u8 *lvl = x + 1;
+
+    while (isdigit(*lvl)) {
+
+      ++lvl;
+
+    }
+
+    if (*lvl) { x = NULL; }
+
+  }
+
+  if (x) {
 
     *x = 0;
     dict_level = atoi(x + 1);
@@ -330,7 +364,7 @@ void load_extras(afl_state_t *afl, u8 *dir) {
   while ((de = readdir(d))) {
 
     struct stat st;
-    u8 *        fn = alloc_printf("%s/%s", dir, de->d_name);
+    u8         *fn = alloc_printf("%s/%s", dir, de->d_name);
     s32         fd;
 
     if (lstat(fn, &st) || access(fn, R_OK)) {
@@ -353,6 +387,7 @@ void load_extras(afl_state_t *afl, u8 *dir) {
           "Extra '%s' is too big (%s, limit is %s)", fn,
           stringify_mem_size(val_bufs[0], sizeof(val_bufs[0]), st.st_size),
           stringify_mem_size(val_bufs[1], sizeof(val_bufs[1]), MAX_DICT_FILE));
+      ck_free(fn);
       continue;
 
     }
@@ -454,13 +489,13 @@ void deunicode_extras(afl_state_t *afl) {
 
         case 2:
           if (!afl->extras[i].data[j]) { ++z3; }
-          // fall through
+          __attribute__((fallthrough));
         case 0:
           if (!afl->extras[i].data[j]) { ++z1; }
           break;
         case 3:
           if (!afl->extras[i].data[j]) { ++z4; }
-          // fall through
+          __attribute__((fallthrough));
         case 1:
           if (!afl->extras[i].data[j]) { ++z2; }
           break;
@@ -743,11 +778,18 @@ void save_auto(afl_state_t *afl) {
 
     u8 *fn =
         alloc_printf("%s/queue/.state/auto_extras/auto_%06u", afl->out_dir, i);
+
     s32 fd;
 
-    fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, DEFAULT_PERMISSION);
+    fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, afl->perm);
 
     if (fd < 0) { PFATAL("Unable to create '%s'", fn); }
+
+    if (afl->chown_needed) {
+
+      if (fchown(fd, -1, afl->fsrv.gid) == -1) { PFATAL("fchown() failed"); }
+
+    }
 
     ck_write(fd, afl->a_extras[i].data, afl->a_extras[i].len, fn);
 

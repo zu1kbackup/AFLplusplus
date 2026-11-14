@@ -6,11 +6,7 @@ FILE=$AFL_PERFORMANCE_FILE
 # otherwise we use ~/.afl_performance
 test -z "$FILE" && FILE=.afl_performance
 
-test -e $FILE || {
-  echo Warning: This script measure the performance of afl++ and saves the result for future comparisons into $FILE
-  echo Press ENTER to continue or CONTROL-C to abort
-  read IN
-}
+test "$1" = "run" || { echo "[*] skipping $0, no value in CI, run with \"run\" to force running"; exit 0; }
 
 test -e ./test-performance.sh || { echo Error: this script must be run from the directory in which it lies. ; exit 1 ; }
 
@@ -26,7 +22,7 @@ unset AFL_USE_ASAN
 unset AFL_USE_MSAN
 unset AFL_CC
 unset AFL_PRELOAD
-unset AFL_GCC_INSTRUMENT_FILE
+unset AFL_COMPILER_INSTRUMENT_FILE
 unset AFL_LLVM_INSTRUMENT_FILE
 unset AFL_LLVM_INSTRIM
 unset AFL_LLVM_LAF_SPLIT_SWITCHES
@@ -37,15 +33,6 @@ unset AFL_LLVM_LAF_SPLIT_COMPARES
 test -e /usr/local/bin/opt && {
   export PATH=/usr/local/bin:${PATH}
 } 
-# on MacOS X we prefer afl-clang over afl-gcc, because
-# afl-gcc does not work there
-test `uname -s` = 'Darwin' -o `uname -s` = 'FreeBSD' && {
-  AFL_GCC=afl-clang
-  CC=clang
-} || {
-  AFL_GCC=afl-gcc
-  CC=gcc
-}
 
 ECHO="printf %b\\n"
 $ECHO \\101 2>&1 | grep -qE '^A' || {
@@ -68,37 +55,12 @@ MEM_LIMIT=500
 
 touch $FILE || { echo Error: can not write to $FILE ; exit 1 ; }
 
-echo Warning: this script is setting performance parameters with afl-system-config
+echo "[!] Warning: this script is setting performance parameters with afl-system-config"
 sleep 1
 afl-system-config > /dev/null 2>&1
-echo Performance settings applied.
-echo
+#echo Performance settings applied.
 
-$ECHO "${RESET}${GREY}[*] starting afl++ performance test framework ..."
-
-$ECHO "$BLUE[*] Testing: ${AFL_GCC}"
-GCC=x
-test -e ../${AFL_GCC} -a -e ../afl-fuzz && {
-  ../${AFL_GCC} -o test-instr.plain ../test-instr.c > /dev/null 2>&1
-  test -e test-instr.plain && {
-    $ECHO "$GREEN[+] ${AFL_GCC} compilation succeeded"
-    mkdir -p in
-    echo 0 > in/in
-    $ECHO "$GREY[*] running afl-fuzz for ${AFL_GCC} for 30 seconds"
-    {
-      ../afl-fuzz -V 30 -s 123 -m ${MEM_LIMIT} -i in -o out-gcc -- ./test-instr.plain
-    } >>errors 2>&1
-    test -n "$( ls out-gcc/default/queue/id:000002* 2> /dev/null )" && {
-      GCC=`grep execs_done out-gcc/default/fuzzer_stats | awk '{print$3}'`
-    } || {
-        echo CUT----------------------------------------------------------------
-        cat errors
-        echo CUT----------------------------------------------------------------
-      $ECHO "$RED[!] afl-fuzz is not working correctly with ${AFL_GCC}"
-    }
-    rm -rf in out-gcc errors test-instr.plain
-  } || $ECHO "$RED[!] ${AFL_GCC} instrumentation failed"
-} || $ECHO "$YELLOW[-] afl is not compiled, cannot test"
+$ECHO "${RESET}${GREY}[*] starting AFL++ performance test framework ..."
 
 $ECHO "$BLUE[*] Testing: llvm_mode"
 LLVM=x
@@ -232,8 +194,7 @@ test -s $FILE && {
   $ECHO "$BLUE[!] qemu_mode: lowest=$LOW_QEMU highest=$HIGH_QEMU last=$LAST_QEMU current=$QEMU"
 } || {
   $ECHO "$YELLOW[!] First run, just saving data"
-  $ECHO "$BLUE[!] afl-gcc=$GCC  llvm_mode=$LLVM  gcc_plugin=$GCCP  qemu_mode=$QEMU"
+  $ECHO "$BLUE[!] llvm_mode=$LLVM  gcc_plugin=$GCCP  qemu_mode=$QEMU"
 }
 echo "$GCC $LLVM $GCCP $QEMU" >> $FILE
-$ECHO "$GREY[*] done."
-$ECHO "$RESET"
+$ECHO "$GREY[*] done.$RESET"

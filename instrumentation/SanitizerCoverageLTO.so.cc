@@ -1,4 +1,6 @@
-/* SanitizeCoverage.cpp ported to afl++ LTO :-) */
+// SanitizerCoverage.cpp ported to AFL++ LTO; derived from the LLVM Project.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+/* SanitizeCoverage.cpp ported to AFL++ LTO :-) */
 
 #define AFL_LLVM_PASS
 
@@ -17,7 +19,12 @@
 #include "llvm/Transforms/Instrumentation/SanitizerCoverage.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Analysis/EHPersonalities.h"
+#if LLVM_VERSION_MAJOR < 17
+  #include "llvm/ADT/Triple.h"
+  #include "llvm/Analysis/EHPersonalities.h"
+#else
+  #include "llvm/IR/EHPersonalities.h"
+#endif
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/BasicBlock.h"
@@ -33,7 +40,6 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Mangler.h"
@@ -46,28 +52,38 @@
 #include "llvm/Support/SpecialCaseList.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/Instrumentation.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#if LLVM_VERSION_MAJOR < 20
+  #include "llvm/Transforms/Instrumentation.h"
+#else
+  #include "llvm/Transforms/Utils/Instrumentation.h"
+#endif
+#if LLVM_VERSION_MAJOR < 17
+  #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#endif
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#if defined(__has_include) && __has_include("llvm/Plugins/PassPlugin.h")
+  #include "llvm/Plugins/PassPlugin.h"
+#else
+  #include "llvm/Passes/PassPlugin.h"
+#endif
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/IR/PassManager.h"
 
 #include "config.h"
 #include "debug.h"
 #include "afl-llvm-common.h"
+#include "PathCoverage.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "sancov"
 
-const char SanCovTracePCIndirName[] = "__sanitizer_cov_trace_pc_indir";
 const char SanCovTracePCName[] = "__sanitizer_cov_trace_pc";
 // const char SanCovTracePCGuardName =
 //    "__sanitizer_cov_trace_pc_guard";
 const char SanCovGuardsSectionName[] = "sancov_guards";
-const char SanCovCountersSectionName[] = "sancov_cntrs";
-const char SanCovBoolFlagSectionName[] = "sancov_bools";
-const char SanCovPCsSectionName[] = "sancov_pcs";
 
 static cl::opt<int> ClCoverageLevel(
     "lto-coverage-level",
@@ -108,6 +124,12 @@ static cl::opt<bool> ClPruneBlocks(
     cl::desc("Reduce the number of instrumented blocks"), cl::Hidden,
     cl::init(true));
 
+namespace llvm {
+
+void initializeModuleSanitizerCoverageLTOLegacyPassPass(PassRegistry &PB);
+
+}
+
 namespace {
 
 SanitizerCoverageOptions getOptions(int LegacyCoverageLevel) {
@@ -143,13 +165,10 @@ SanitizerCoverageOptions OverrideFromCL(SanitizerCoverageOptions Options) {
   // Sets CoverageType and IndirectCalls.
   SanitizerCoverageOptions CLOpts = getOptions(ClCoverageLevel);
   Options.CoverageType = std::max(Options.CoverageType, CLOpts.CoverageType);
-  Options.IndirectCalls |= CLOpts.IndirectCalls;
   Options.TracePC |= ClTracePC;
   Options.TracePCGuard |= ClTracePCGuard;
-  Options.Inline8bitCounters |= ClInline8bitCounters;
-  Options.InlineBoolFlag |= ClInlineBoolFlag;
-  Options.PCTable |= ClCreatePCTable;
   Options.NoPrune |= !ClPruneBlocks;
+  if (getenv("AFL_LLVM_DENSE")) { Options.NoPrune = true; }
   if (!Options.TracePCGuard && !Options.TracePC &&
       !Options.Inline8bitCounters && !Options.InlineBoolFlag)
     Options.TracePCGuard = true;  // TracePCGuard is default.
@@ -161,108 +180,124 @@ using DomTreeCallback = function_ref<const DominatorTree *(Function &F)>;
 using PostDomTreeCallback =
     function_ref<const PostDominatorTree *(Function &F)>;
 
-class ModuleSanitizerCoverage {
+class ModuleSanitizerCoverageLTO
+    : public PassInfoMixin<ModuleSanitizerCoverageLTO> {
 
  public:
-  ModuleSanitizerCoverage(
+  ModuleSanitizerCoverageLTO(
       const SanitizerCoverageOptions &Options = SanitizerCoverageOptions())
       : Options(OverrideFromCL(Options)) {
-
-    /* ,
-    const SpecialCaseList *         Allowlist = nullptr,
-    const SpecialCaseList *         Blocklist = nullptr)
-      ,
-      Allowlist(Allowlist),
-      Blocklist(Blocklist) {
-
-    */
 
   }
 
   bool instrumentModule(Module &M, DomTreeCallback DTCallback,
                         PostDomTreeCallback PDTCallback);
 
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
+
  private:
-  void            instrumentFunction(Function &F, DomTreeCallback DTCallback,
-                                     PostDomTreeCallback PDTCallback);
-  void            InjectCoverageForIndirectCalls(Function &              F,
-                                                 ArrayRef<Instruction *> IndirCalls);
-  bool            InjectCoverage(Function &F, ArrayRef<BasicBlock *> AllBlocks,
-                                 bool IsLeafFunc = true);
+  void instrumentFunction(Function &F, DomTreeCallback DTCallback,
+                          PostDomTreeCallback PDTCallback);
+  bool InjectCoverage(Function &F, ArrayRef<BasicBlock *> AllBlocks,
+                      bool IsLeafFunc = true);
+  bool Fake_InjectCoverage(Function &F, ArrayRef<BasicBlock *> AllBlocks,
+                           bool IsLeafFunc = true);
   GlobalVariable *CreateFunctionLocalArrayInSection(size_t    NumElements,
                                                     Function &F, Type *Ty,
                                                     const char *Section);
-  GlobalVariable *CreatePCArray(Function &F, ArrayRef<BasicBlock *> AllBlocks);
   void CreateFunctionLocalArrays(Function &F, ArrayRef<BasicBlock *> AllBlocks);
   void InjectCoverageAtBlock(Function &F, BasicBlock &BB, size_t Idx,
                              bool IsLeafFunc = true);
-  //  std::pair<Value *, Value *> CreateSecStartEnd(Module &M, const char
-  //  *Section,
-  //                                                Type *Ty);
 
-  void SetNoSanitizeMetadata(Instruction *I) {
+  /* Ball-Larus path coverage (AFL_LLVM_LTO_PATH).  Inserts a per-function
+     path register, edge increments on non-back edges, and a bitmap write
+     at every exit point.  No-op if path_mode == false or function is
+     ineligible.  Returns the number of slots reserved (0 if skipped).    */
+  /* Analyse the function's CFG *before* InjectCoverage mutates it (so
+     isGuardOnlyBB sees the source-level BBs, not BBs polluted by edge-
+     counter stores).  Stores per-function results in path* members. */
+  bool     analyzePathCoverage(Function &F);
+  uint64_t instrumentPathCoverage(Function &F, const DominatorTree *DT,
+                                  uint32_t call_counter, LoadInst *PrevCtxLoad);
 
-    I->setMetadata(I->getModule()->getMDKindID("nosanitize"),
-                   MDNode::get(*C, None));
-
-  }
-
-  std::string getSectionName(const std::string &Section) const;
-  //  std::string    getSectionStart(const std::string &Section) const;
-  //  std::string    getSectionEnd(const std::string &Section) const;
-  FunctionCallee SanCovTracePCIndir;
+  std::string    getSectionName(const std::string &Section) const;
   FunctionCallee SanCovTracePC /*, SanCovTracePCGuard*/;
   Type *IntptrTy, *IntptrPtrTy, *Int64Ty, *Int64PtrTy, *Int32Ty, *Int32PtrTy,
-      *Int16Ty, *Int8Ty, *Int8PtrTy, *Int1Ty, *Int1PtrTy;
-  Module *          CurModule;
+      *Int16Ty, *Int8Ty, *Int8PtrTy, *Int1Ty, *Int1PtrTy, *PtrTy;
+  Module           *CurModule;
   std::string       CurModuleUniqueId;
   Triple            TargetTriple;
-  LLVMContext *     C;
+  LLVMContext      *C;
   const DataLayout *DL;
 
-  GlobalVariable *FunctionGuardArray;        // for trace-pc-guard.
-  GlobalVariable *Function8bitCounterArray;  // for inline-8bit-counters.
-  GlobalVariable *FunctionBoolArray;         // for inline-bool-flag.
-  GlobalVariable *FunctionPCsArray;          // for pc-table.
+  GlobalVariable                *FunctionGuardArray;  // for trace-pc-guard.
   SmallVector<GlobalValue *, 20> GlobalsToAppendToUsed;
   SmallVector<GlobalValue *, 20> GlobalsToAppendToCompilerUsed;
 
   SanitizerCoverageOptions Options;
 
-  // afl++ START
+  // AFL++ START
   // const SpecialCaseList *          Allowlist;
   // const SpecialCaseList *          Blocklist;
-  uint32_t                         autodictionary = 1;
-  uint32_t                         inst = 0;
-  uint32_t                         afl_global_id = 0;
+  uint32_t autodictionary = 1;
+  uint32_t autodictionary_no_main = 0;
+  uint32_t inst = 0;
+  uint32_t afl_global_id = 0;
+  uint32_t unhandled = 0;
+  uint32_t decision_cnt = 0;
+  uint32_t instrument_ctx = 0;
+  uint32_t instrument_ctx_max_depth = 0;
+  uint32_t extra_ctx_inst = 0;
+  bool     path_mode = false;       // Ball-Larus path
+  uint32_t path_mode_level = 0;     // 1=relaxed, 2=restricted, 3=strict
+  uint64_t extra_path_inst = 0;     // sum of paths
+  uint32_t path_skipped_funcs = 0;  // skipped funcs
+  uint64_t path_max_paths = 100000;
+  /* Populated by analyzePathCoverage() before InjectCoverage runs and
+     consumed by instrumentPathCoverage() afterwards.  See PathCoverage.h. */
+  llvm::DenseMap<llvm::BasicBlock *, uint64_t> pathNumPaths;
+  llvm::DenseMap<std::pair<llvm::BasicBlock *, llvm::BasicBlock *>, uint64_t>
+                                                                  pathEdgeVal;
+  std::vector<std::pair<llvm::BasicBlock *, llvm::Instruction *>> pathExits;
+  uint64_t                         pathNumEntry = 0;
   uint64_t                         map_addr = 0;
-  const char *                     skip_nozero = NULL;
-  const char *                     use_threadsafe_counters = nullptr;
+  const char                      *skip_nozero = NULL;
+  const char                      *use_threadsafe_counters = nullptr;
   std::vector<BasicBlock *>        BlockList;
   DenseMap<Value *, std::string *> valueMap;
   std::vector<std::string>         dictionary;
-  IntegerType *                    Int8Tyi = NULL;
-  IntegerType *                    Int32Tyi = NULL;
-  IntegerType *                    Int64Tyi = NULL;
-  ConstantInt *                    Zero = NULL;
-  ConstantInt *                    One = NULL;
-  LLVMContext *                    Ct = NULL;
-  Module *                         Mo = NULL;
-  GlobalVariable *                 AFLMapPtr = NULL;
-  Value *                          MapPtrFixed = NULL;
-  FILE *                           documentFile = NULL;
+  IntegerType                     *Int8Tyi = NULL;
+  IntegerType                     *Int32Tyi = NULL;
+  IntegerType                     *Int64Tyi = NULL;
+  ConstantInt                     *Zero = NULL;
+  ConstantInt                     *Zero32 = NULL;
+  ConstantInt                     *One = NULL;
+  LLVMContext                     *Ct = NULL;
+  Module                          *Mo = NULL;
+  GlobalVariable                  *AFLContext = NULL;
+  GlobalVariable                  *AFLMapPtr = NULL;
+  GlobalVariable                  *AFLCovMapSize = NULL;
+  GlobalVariable                  *AFLIJONState = NULL;
+  const char                      *ijon_enabled = nullptr;
+  Value                           *MapPtrFixed = NULL;
+  Value                           *HoistedMapPtr = NULL;
+  AllocaInst                      *CTX_add = NULL;
+  std::ofstream                    dFile;
   size_t                           found = 0;
-  // afl++ END
+  bool                             deny_exec = false;
+  bool                             reachability_mode = false;
+  StringMap<uint32_t>              reachabilityValues;
+  // AFL++ END
 
 };
 
-class ModuleSanitizerCoverageLegacyPass : public ModulePass {
+class ModuleSanitizerCoverageLTOLegacyPass : public ModulePass {
 
  public:
   static char ID;
   StringRef   getPassName() const override {
 
-    return "sancov";
+    return "sancov-lto";
 
   }
 
@@ -273,31 +308,18 @@ class ModuleSanitizerCoverageLegacyPass : public ModulePass {
 
   }
 
-  ModuleSanitizerCoverageLegacyPass(
+  ModuleSanitizerCoverageLTOLegacyPass(
       const SanitizerCoverageOptions &Options = SanitizerCoverageOptions())
       : ModulePass(ID), Options(Options) {
 
-    /* ,
-          const std::vector<std::string> &AllowlistFiles =
-              std::vector<std::string>(),
-          const std::vector<std::string> &BlocklistFiles =
-              std::vector<std::string>())
-        if (AllowlistFiles.size() > 0)
-          Allowlist = SpecialCaseList::createOrDie(AllowlistFiles,
-                                                   *vfs::getRealFileSystem());
-        if (BlocklistFiles.size() > 0)
-          Blocklist = SpecialCaseList::createOrDie(BlocklistFiles,
-                                                   *vfs::getRealFileSystem());
-    */
-    initializeModuleSanitizerCoverageLegacyPassPass(
+    initializeModuleSanitizerCoverageLTOLegacyPassPass(
         *PassRegistry::getPassRegistry());
 
   }
 
   bool runOnModule(Module &M) override {
 
-    ModuleSanitizerCoverage ModuleSancov(Options);
-    // , Allowlist.get(), Blocklist.get());
+    ModuleSanitizerCoverageLTO ModuleSancov(Options);
     auto DTCallback = [this](Function &F) -> const DominatorTree * {
 
       return &this->getAnalysis<DominatorTreeWrapperPass>(F).getDomTree();
@@ -311,27 +333,54 @@ class ModuleSanitizerCoverageLegacyPass : public ModulePass {
 
     };
 
-    return ModuleSancov.instrumentModule(M, DTCallback, PDTCallback);
+    if (!getenv("AFL_LLVM_ONLY_FSRV")) {
+
+      return ModuleSancov.instrumentModule(M, DTCallback, PDTCallback);
+
+    } else {
+
+      if (getenv("AFL_DEBUG")) { DEBUGF("Instrumentation disabled\n"); }
+      return false;
+
+    }
 
   }
 
  private:
   SanitizerCoverageOptions Options;
 
-  // std::unique_ptr<SpecialCaseList> Allowlist;
-  // std::unique_ptr<SpecialCaseList> Blocklist;
-
 };
 
 }  // namespace
 
-PreservedAnalyses ModuleSanitizerCoveragePass::run(Module &               M,
-                                                   ModuleAnalysisManager &MAM) {
+extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
+llvmGetPassPluginInfo() {
 
-  ModuleSanitizerCoverage ModuleSancov(Options);
-  // Allowlist.get(), Blocklist.get());
+  return {LLVM_PLUGIN_API_VERSION, "SanitizerCoverageLTO", "v0.1",
+          /* lambda to insert our pass into the pass pipeline. */
+          [](PassBuilder &PB) {
+
+#if LLVM_VERSION_MAJOR >= 15
+            PB.registerFullLinkTimeOptimizationLastEPCallback(
+#else
+            PB.registerOptimizerLastEPCallback(
+#endif
+                [](ModulePassManager &MPM, OptimizationLevel OL) {
+
+                  MPM.addPass(ModuleSanitizerCoverageLTO());
+
+                });
+
+          }};
+
+}
+
+PreservedAnalyses ModuleSanitizerCoverageLTO::run(Module                &M,
+                                                  ModuleAnalysisManager &MAM) {
+
+  ModuleSanitizerCoverageLTO ModuleSancov(Options);
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
-  auto  DTCallback = [&FAM](Function &F) -> const DominatorTree * {
+  auto  DTCallback = [&FAM](Function &F) -> const DominatorTree  *{
 
     return &FAM.getResult<DominatorTreeAnalysis>(F);
 
@@ -343,117 +392,298 @@ PreservedAnalyses ModuleSanitizerCoveragePass::run(Module &               M,
 
   };
 
-  if (ModuleSancov.instrumentModule(M, DTCallback, PDTCallback))
-    return PreservedAnalyses::none();
+  if (!getenv("AFL_LLVM_ONLY_FSRV")) {
+
+    if (ModuleSancov.instrumentModule(M, DTCallback, PDTCallback))
+      return PreservedAnalyses::none();
+
+  } else {
+
+    if (debug) { DEBUGF("Instrumentation disabled\n"); }
+
+  }
 
   return PreservedAnalyses::all();
 
 }
 
-/*
-std::pair<Value *, Value *> ModuleSanitizerCoverage::CreateSecStartEnd(
-    Module &M, const char *Section, Type *Ty) {
-
-  GlobalVariable *SecStart =
-      new GlobalVariable(M, Ty, false, GlobalVariable::ExternalLinkage, nullptr,
-                         getSectionStart(Section));
-  SecStart->setVisibility(GlobalValue::HiddenVisibility);
-  GlobalVariable *SecEnd =
-      new GlobalVariable(M, Ty, false, GlobalVariable::ExternalLinkage, nullptr,
-                         getSectionEnd(Section));
-  SecEnd->setVisibility(GlobalValue::HiddenVisibility);
-  IRBuilder<> IRB(M.getContext());
-  Value *     SecEndPtr = IRB.CreatePointerCast(SecEnd, Ty);
-  if (!TargetTriple.isOSBinFormatCOFF())
-    return std::make_pair(IRB.CreatePointerCast(SecStart, Ty), SecEndPtr);
-
-  // Account for the fact that on windows-msvc __start_* symbols actually
-  // point to a uint64_t before the start of the array.
-  auto SecStartI8Ptr = IRB.CreatePointerCast(SecStart, Int8PtrTy);
-  auto GEP = IRB.CreateGEP(Int8Ty, SecStartI8Ptr,
-                           ConstantInt::get(IntptrTy, sizeof(uint64_t)));
-  return std::make_pair(IRB.CreatePointerCast(GEP, Ty), SecEndPtr);
-
-}
-
-*/
-
-bool ModuleSanitizerCoverage::instrumentModule(
+bool ModuleSanitizerCoverageLTO::instrumentModule(
     Module &M, DomTreeCallback DTCallback, PostDomTreeCallback PDTCallback) {
 
   if (Options.CoverageType == SanitizerCoverageOptions::SCK_None) return false;
   /*
     if (Allowlist &&
-        !Allowlist->inSection("coverage", "src", M.getSourceFileName()))
+        !Allowlist->inSection("coverage", "src", MNAME))
       return false;
     if (Blocklist &&
-        Blocklist->inSection("coverage", "src", M.getSourceFileName()))
+        Blocklist->inSection("coverage", "src", MNAME))
       return false;
   */
   BlockList.clear();
+  for (auto &kv : valueMap)
+    delete kv.second;
   valueMap.clear();
   dictionary.clear();
+  GlobalsToAppendToUsed.clear();
+  GlobalsToAppendToCompilerUsed.clear();
   C = &(M.getContext());
   DL = &M.getDataLayout();
   CurModule = &M;
   CurModuleUniqueId = getUniqueModuleId(CurModule);
   TargetTriple = Triple(M.getTargetTriple());
   FunctionGuardArray = nullptr;
-  Function8bitCounterArray = nullptr;
-  FunctionBoolArray = nullptr;
-  FunctionPCsArray = nullptr;
   IntptrTy = Type::getIntNTy(*C, DL->getPointerSizeInBits());
-  IntptrPtrTy = PointerType::getUnqual(IntptrTy);
-  Type *      VoidTy = Type::getVoidTy(*C);
+  Type       *VoidTy = Type::getVoidTy(*C);
   IRBuilder<> IRB(*C);
+  PtrTy = PointerType::getUnqual(*C);
+#if LLVM_MAJOR >= 20
+  IntptrPtrTy = Int64PtrTy = Int32PtrTy = Int8PtrTy = Int1PtrTy = PtrTy;
+#else
+  IntptrPtrTy = PointerType::getUnqual(IntptrTy);
   Int64PtrTy = PointerType::getUnqual(IRB.getInt64Ty());
   Int32PtrTy = PointerType::getUnqual(IRB.getInt32Ty());
   Int8PtrTy = PointerType::getUnqual(IRB.getInt8Ty());
   Int1PtrTy = PointerType::getUnqual(IRB.getInt1Ty());
+#endif
   Int64Ty = IRB.getInt64Ty();
   Int32Ty = IRB.getInt32Ty();
   Int16Ty = IRB.getInt16Ty();
   Int8Ty = IRB.getInt8Ty();
   Int1Ty = IRB.getInt1Ty();
 
-  /* afl++ START */
-  char *       ptr;
+  /* AFL++ START */
+  char        *ptr;
   LLVMContext &Ctx = M.getContext();
   Ct = &Ctx;
   Int8Tyi = IntegerType::getInt8Ty(Ctx);
   Int32Tyi = IntegerType::getInt32Ty(Ctx);
   Int64Tyi = IntegerType::getInt64Ty(Ctx);
 
+  // Check if IJON state-aware coverage is enabled
+  ijon_enabled = getenv("AFL_LLVM_IJON");
+  if (getenv("AFL_LLVM_DENY_EXEC")) deny_exec = true;
+
+  // If IJON is enabled, check if the module actually uses any IJON functions
+  bool uses_ijon_functions = false;
+  bool uses_ijon_state = false;
+
+  if (ijon_enabled) {
+
+    std::tie(uses_ijon_functions, uses_ijon_state) = detectIJONUsage(M);
+    if (!uses_ijon_functions) { ijon_enabled = nullptr; }
+
+  }
+
+  // Initialize IJON symbols based on what functions are used
+  if (ijon_enabled) {
+
+    createIJONEnabledGlobal(M, Int32Ty);
+    AFLIJONState = createIJONStateGlobal(M, Int32Tyi, uses_ijon_state);
+
+  }
+
   /* Show a banner */
   setvbuf(stdout, NULL, _IONBF, 0);
-  if (getenv("AFL_DEBUG")) debug = 1;
+  if (getenv("AFL_DEBUG")) { debug = 1; }
+  if (getenv("AFL_LLVM_DICT2FILE_NO_MAIN")) { autodictionary_no_main = 1; }
+  if (getenv("AFL_LLVM_CALLER") || getenv("AFL_LLVM_CTX") ||
+      getenv("AFL_LLVM_LTO_CALLER") || getenv("AFL_LLVM_LTO_CTX")) {
+
+    instrument_ctx = 1;
+
+  }
+
+  if (getenv("AFL_LLVM_LTO_CALLER_DEPTH")) {
+
+    instrument_ctx_max_depth = atoi(getenv("AFL_LLVM_LTO_CALLER_DEPTH"));
+
+  } else if (getenv("AFL_LLVM_LTO_CTX_DEPTH")) {
+
+    instrument_ctx_max_depth = atoi(getenv("AFL_LLVM_LTO_CTX_DEPTH"));
+
+  } else if (getenv("AFL_LLVM_CALLER_DEPTH")) {
+
+    instrument_ctx_max_depth = atoi(getenv("AFL_LLVM_CALLER_DEPTH"));
+
+  } else if (getenv("AFL_LLVM_CTX_DEPTH")) {
+
+    instrument_ctx_max_depth = atoi(getenv("AFL_LLVM_CTX_DEPTH"));
+
+  }
+
+  /* AFL_LLVM_LTO_PATH (and aliases AFL_LLVM_PATH / AFL_LLVM_PATH_MODE):
+     Ball-Larus per-function path coverage on top of edge coverage.
+     Levels:
+       (unset/"0") — disabled.
+       "1" / ""    — relaxed: collapse every guard-only basic block (no
+                     calls, no stores, no atomics) via max(succ) instead
+                     of sum(succ).  Short-circuit `&&`/`||`, pure-condition
+                     chains, and switch-on-loaded-value collapse to a
+                     single decision.  Smallest map.
+       "2"         — restricted: like "1" but only collapse 2-successor
+                     guard-only BBs.  Switches and indirect branches
+                     remain as sum-merged decisions.  Slightly larger
+                     map than "1".
+       "3"         — strict Ball-Larus: every IR-level acyclic path has
+                     its own slot.  Largest map; matches the literal
+                     "every possible path is a unique route" reading.
+     Other values are rejected. */
+  {
+
+    const char *p = getenv("AFL_LLVM_LTO_PATH");
+    if (!p) p = getenv("AFL_LLVM_PATH");
+    if (!p) p = getenv("AFL_LLVM_PATH_MODE");
+    if (p) {
+
+      if (*p == 0) {
+
+        /* Reject the empty value rather than silently enabling level 1 —
+           users who want level 1 should pass "1". */
+        FATAL(
+            "AFL_LLVM_LTO_PATH/AFL_LLVM_PATH/AFL_LLVM_PATH_MODE was set to "
+            "an empty value. Use \"1\" (relaxed), \"2\" (restricted), "
+            "\"3\" (strict), or \"0\" (off).");
+
+      } else if (strcmp(p, "1") == 0) {
+
+        path_mode_level = 1;
+
+      } else if (strcmp(p, "2") == 0) {
+
+        path_mode_level = 2;
+
+      } else if (strcmp(p, "3") == 0) {
+
+        path_mode_level = 3;
+
+      } else if (strcmp(p, "0") == 0) {
+
+        path_mode_level = 0;
+
+      } else {
+
+        FATAL(
+            "AFL_LLVM_LTO_PATH/AFL_LLVM_PATH/AFL_LLVM_PATH_MODE only "
+            "accepts \"0\" (off), \"1\" (relaxed), \"2\" (restricted), or "
+            "\"3\" (strict). Got %s.",
+            p);
+
+      }
+
+      path_mode = (path_mode_level > 0);
+
+    }
+
+  }
+
+  if (const char *mp = getenv("AFL_LLVM_PATH_MAX_PATHS")) {
+
+    char              *end = nullptr;
+    unsigned long long v = strtoull(mp, &end, 10);
+    if (!end || *end || v < 2 || v > (unsigned long long)INT32_MAX) {
+
+      /* INT32_MAX upper bound: the IR path index is held in a signed
+         i32 register, so any value beyond that would let path_base +
+         path_reg overflow the bitmap GEP. */
+      FATAL("AFL_LLVM_PATH_MAX_PATHS must be an integer in [2, %d] (got %s).",
+            INT32_MAX, mp);
+
+    }
+
+    path_max_paths = (uint64_t)v;
+
+  }
+
+  /* CTX_DEPTH > 1 + PATH would compute
+       idx = path_base + path_reg + cid * NumPaths
+     in i32, but `cid` is the AFLContext XOR-stack value which is *not*
+     bounded by call_counter when depth > 1. The result can fall outside
+     the reserved [path_base, path_base + numPaths * call_counter) range
+     and either alias another function's slots or write out-of-bounds.
+     Refuse the combination loudly rather than silently corrupt coverage. */
+  if (path_mode && instrument_ctx_max_depth > 1) {
+
+    FATAL(
+        "AFL_LLVM_CTX_DEPTH/AFL_LLVM_CALLER_DEPTH > 1 cannot be combined "
+        "with AFL_LLVM_PATH: at depth > 1 AFLContext is an XOR-stack of "
+        "caller IDs and is not bounded by call_counter, so the path "
+        "index math (path_base + cid * NumPaths + path) cannot stay in "
+        "range. Use depth = 1 with PATH, or disable PATH.");
+
+  }
 
   if ((isatty(2) && !getenv("AFL_QUIET")) || debug) {
 
-    SAYF(cCYA "afl-llvm-lto" VERSION cRST
-              " by Marc \"vanHauser\" Heuse <mh@mh-sec.de>\n");
+    char        buf[160] = {};
+    const char *path_label;
+    switch (path_mode_level) {
 
-  } else
+      case 1:
+        path_label = "PATH mode (relaxed)";
+        break;
+      case 2:
+        path_label = "PATH mode (restricted)";
+        break;
+      case 3:
+        path_label = "PATH mode (strict)";
+        break;
+      default:
+        path_label = "PATH mode";
+        break;
+
+    }
+
+    if (instrument_ctx && path_mode) {
+
+      snprintf(buf, sizeof(buf), " (CTX mode, depth %u, %s)",
+               instrument_ctx_max_depth, path_label);
+
+    } else if (instrument_ctx) {
+
+      snprintf(buf, sizeof(buf), " (CTX mode, depth %u)",
+               instrument_ctx_max_depth);
+
+    } else if (path_mode) {
+
+      snprintf(buf, sizeof(buf), " (%s)", path_label);
+
+    }
+
+    SAYF(cCYA "afl-llvm-lto" VERSION cRST
+              "%s by Marc \"vanHauser\" Heuse <mh@mh-sec.de>\n",
+         buf);
+
+  } else {
 
     be_quiet = 1;
+
+  }
 
   skip_nozero = getenv("AFL_LLVM_SKIP_NEVERZERO");
   use_threadsafe_counters = getenv("AFL_LLVM_THREADSAFE_INST");
 
-  if ((ptr = getenv("AFL_LLVM_LTO_STARTID")) != NULL)
-    if ((afl_global_id = atoi(ptr)) < 0)
+  reachability_mode = setupReachability(reachabilityValues, "afl-llvm-lto");
+
+  if ((ptr = getenv("AFL_LLVM_LTO_STARTID")) != NULL) {
+
+    int val = atoi(ptr);
+    if (val < 0)
       FATAL("AFL_LLVM_LTO_STARTID value of \"%s\" is negative\n", ptr);
+    afl_global_id = (uint32_t)val;
+
+  }
+
+  if (afl_global_id < 4) { afl_global_id = 4; }
 
   if ((ptr = getenv("AFL_LLVM_DOCUMENT_IDS")) != NULL) {
 
-    if ((documentFile = fopen(ptr, "a")) == NULL)
-      WARNF("Cannot access document file %s", ptr);
+    dFile.open(ptr, std::ofstream::out | std::ofstream::app);
+    if (!dFile.is_open()) WARNF("Cannot access document file %s", ptr);
 
   }
 
   // we make this the default as the fixed map has problems with
-  // defered forkserver, early constructors, ifuncs and maybe more
-  /*if (getenv("AFL_LLVM_MAP_DYNAMIC"))*/
+  // deferred forkserver, early constructors, ifuncs and maybe more
   map_addr = 0;
 
   if ((ptr = getenv("AFL_LLVM_MAP_ADDR"))) {
@@ -462,11 +692,6 @@ bool ModuleSanitizerCoverage::instrumentModule(
     if (!*ptr || !strcmp(ptr, "0") || !strcmp(ptr, "0x0")) {
 
       map_addr = 0;
-
-    } else if (getenv("AFL_LLVM_MAP_DYNAMIC")) {
-
-      FATAL(
-          "AFL_LLVM_MAP_ADDR and AFL_LLVM_MAP_DYNAMIC cannot be used together");
 
     } else if (strncmp(ptr, "0x", 2) != 0) {
 
@@ -493,19 +718,29 @@ bool ModuleSanitizerCoverage::instrumentModule(
 
   if (!map_addr) {
 
-    AFLMapPtr =
-        new GlobalVariable(M, PointerType::get(Int8Tyi, 0), false,
-                           GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
+    // may already exist: the C11 pass creates it earlier at PipelineStartEP
+    AFLMapPtr = M.getGlobalVariable("__afl_area_ptr");
+    if (!AFLMapPtr)
+      AFLMapPtr = new GlobalVariable(
+          M, PtrTy, false, GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
 
   } else {
 
     ConstantInt *MapAddr = ConstantInt::get(Int64Tyi, map_addr);
-    MapPtrFixed =
-        ConstantExpr::getIntToPtr(MapAddr, PointerType::getUnqual(Int8Tyi));
+    MapPtrFixed = ConstantExpr::getIntToPtr(MapAddr, PtrTy);
 
   }
 
+  AFLCovMapSize =
+      new GlobalVariable(M, Int32Tyi, false, GlobalValue::ExternalLinkage, 0,
+                         "__afl_cov_map_size");
+
+  AFLContext = new GlobalVariable(
+      M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_prev_ctx", 0,
+      GlobalVariable::GeneralDynamicTLSModel, 0, false);
+
   Zero = ConstantInt::get(Int8Tyi, 0);
+  Zero32 = ConstantInt::get(Int32Tyi, 0);
   One = ConstantInt::get(Int8Tyi, 1);
 
   initInstrumentList();
@@ -516,18 +751,25 @@ bool ModuleSanitizerCoverage::instrumentModule(
 
     for (auto &F : M) {
 
-      if (!isInInstrumentList(&F) || !F.size()) { continue; }
+      if (!isInInstrumentList(&F, MNAME) || !F.size()) { continue; }
+
+      if (autodictionary_no_main &&
+          (!F.getName().compare("main") || !F.getName().compare("_main"))) {
+
+        continue;
+
+      }
 
       for (auto &BB : F) {
 
         for (auto &IN : BB) {
 
           CallInst *callInst = nullptr;
-          CmpInst * cmpInst = nullptr;
+          CmpInst  *cmpInst = nullptr;
 
           if ((cmpInst = dyn_cast<CmpInst>(&IN))) {
 
-            Value *      op = cmpInst->getOperand(1);
+            Value       *op = cmpInst->getOperand(1);
             ConstantInt *ilen = dyn_cast<ConstantInt>(op);
 
             if (ilen && ilen->uge(0xffffffffffffffff) == false) {
@@ -549,8 +791,8 @@ bool ModuleSanitizerCoverage::instrumentModule(
                   case CmpInst::ICMP_SGT:
 
                     // signed comparison and it is a negative constant
-                    if ((len == 4 && (val & 80000000)) ||
-                        (len == 8 && (val & 8000000000000000))) {
+                    if ((len == 4 && (val & 0x80000000)) ||
+                        (len == 8 && (val & 0x8000000000000000))) {
 
                       if ((val & 0xffff) != 1) val2 = val - 1;
                       break;
@@ -572,8 +814,8 @@ bool ModuleSanitizerCoverage::instrumentModule(
                   case CmpInst::ICMP_SGE:
 
                     // signed comparison and it is a negative constant
-                    if ((len == 4 && (val & 80000000)) ||
-                        (len == 8 && (val & 8000000000000000))) {
+                    if ((len == 4 && (val & 0x80000000)) ||
+                        (len == 8 && (val & 0x8000000000000000))) {
 
                       if ((val & 0xffff) != 1) val2 = val - 1;
                       break;
@@ -595,12 +837,12 @@ bool ModuleSanitizerCoverage::instrumentModule(
                 }
 
                 dictionary.push_back(std::string((char *)&val, len));
-                found++;
+                ++found;
 
                 if (val2) {
 
                   dictionary.push_back(std::string((char *)&val2, len));
-                  found++;
+                  ++found;
 
                 }
 
@@ -619,11 +861,13 @@ bool ModuleSanitizerCoverage::instrumentModule(
             bool   isStrncasecmp = true;
             bool   isIntMemcpy = true;
             bool   isStdString = true;
-            bool   addedNull = false;
+            bool   isStrstr = true;
+            bool   isGStrstrLen = true;
             size_t optLen = 0;
 
             Function *Callee = callInst->getCalledFunction();
             if (!Callee) continue;
+            if (Callee->isIntrinsic()) continue;
             if (callInst->getCallingConv() != llvm::CallingConv::C) continue;
             std::string FuncName = Callee->getName().str();
 
@@ -667,10 +911,19 @@ bool ModuleSanitizerCoverage::instrumentModule(
                   FuncName.find("compare") != std::string::npos) ||
                  (FuncName.find("basic_string") != std::string::npos &&
                   FuncName.find("find") != std::string::npos));
+            isStrstr &= (!FuncName.compare("strstr") ||
+                         !FuncName.compare("strcasestr") ||
+                         !FuncName.compare("ap_strcasestr") ||
+                         !FuncName.compare("xmlStrstr") ||
+                         !FuncName.compare("xmlStrcasestr"));
+            isGStrstrLen &= !FuncName.compare("g_strstr_len");
 
             /* we do something different here, putting this BB and the
                successors in a block map */
-            if (!FuncName.compare("__afl_persistent_loop")) {
+            /* "\1___..." is the Mach-O form of the __AFL_LOOP asm label, see
+               markPersistentLoopEdges() */
+            if (!FuncName.compare("__afl_persistent_loop") ||
+                !FuncName.compare("\1___afl_persistent_loop")) {
 
               BlockList.push_back(&BB);
               for (succ_iterator SI = succ_begin(&BB), SE = succ_end(&BB);
@@ -684,23 +937,34 @@ bool ModuleSanitizerCoverage::instrumentModule(
             }
 
             if (!isStrcmp && !isMemcmp && !isStrncmp && !isStrcasecmp &&
-                !isStrncasecmp && !isIntMemcpy && !isStdString)
+                !isStrncasecmp && !isIntMemcpy && !isStdString && !isStrstr &&
+                !isGStrstrLen)
               continue;
 
-            /* Verify the strcmp/memcmp/strncmp/strcasecmp/strncasecmp function
-             * prototype */
+            /* Verify the strcmp/memcmp/strncmp/strcasecmp/strncasecmp/strstr
+             * function prototype */
             FunctionType *FT = Callee->getFunctionType();
 
             isStrcmp &= FT->getNumParams() == 2 &&
                         FT->getReturnType()->isIntegerTy(32) &&
                         FT->getParamType(0) == FT->getParamType(1) &&
+#if LLVM_MAJOR >= 17
+                        FT->getParamType(0)->isPointerTy();
+#else
                         FT->getParamType(0) ==
-                            IntegerType::getInt8PtrTy(M.getContext());
+                            IntegerType::getInt8Ty(M.getContext())
+                                ->getPointerTo(0);
+#endif
             isStrcasecmp &= FT->getNumParams() == 2 &&
                             FT->getReturnType()->isIntegerTy(32) &&
                             FT->getParamType(0) == FT->getParamType(1) &&
+#if LLVM_MAJOR >= 17
+                            FT->getParamType(0)->isPointerTy();
+#else
                             FT->getParamType(0) ==
-                                IntegerType::getInt8PtrTy(M.getContext());
+                                IntegerType::getInt8Ty(M.getContext())
+                                    ->getPointerTo(0);
+#endif
             isMemcmp &= FT->getNumParams() == 3 &&
                         FT->getReturnType()->isIntegerTy(32) &&
                         FT->getParamType(0)->isPointerTy() &&
@@ -709,29 +973,54 @@ bool ModuleSanitizerCoverage::instrumentModule(
             isStrncmp &= FT->getNumParams() == 3 &&
                          FT->getReturnType()->isIntegerTy(32) &&
                          FT->getParamType(0) == FT->getParamType(1) &&
+#if LLVM_MAJOR >= 17
+                         FT->getParamType(0)->isPointerTy() &&
+#else
                          FT->getParamType(0) ==
-                             IntegerType::getInt8PtrTy(M.getContext()) &&
+                             IntegerType::getInt8Ty(M.getContext())
+                                 ->getPointerTo(0) &&
+#endif
                          FT->getParamType(2)->isIntegerTy();
             isStrncasecmp &= FT->getNumParams() == 3 &&
                              FT->getReturnType()->isIntegerTy(32) &&
                              FT->getParamType(0) == FT->getParamType(1) &&
+#if LLVM_MAJOR >= 17
+                             FT->getParamType(0)->isPointerTy() &&
+#else
                              FT->getParamType(0) ==
-                                 IntegerType::getInt8PtrTy(M.getContext()) &&
+                                 IntegerType::getInt8Ty(M.getContext())
+                                     ->getPointerTo(0) &&
+#endif
                              FT->getParamType(2)->isIntegerTy();
             isStdString &= FT->getNumParams() >= 2 &&
                            FT->getParamType(0)->isPointerTy() &&
                            FT->getParamType(1)->isPointerTy();
+            isStrstr &= FT->getNumParams() == 2 &&
+                        FT->getReturnType()->isPointerTy() &&
+                        FT->getParamType(0)->isPointerTy() &&
+                        FT->getParamType(1)->isPointerTy();
+            // g_strstr_len: gchar* (const gchar *haystack, gssize haystack_len,
+            //                       const gchar *needle)
+            isGStrstrLen &= FT->getNumParams() == 3 &&
+                            FT->getReturnType()->isPointerTy() &&
+                            FT->getParamType(0)->isPointerTy() &&
+                            FT->getParamType(1)->isIntegerTy() &&
+                            FT->getParamType(2)->isPointerTy();
 
             if (!isStrcmp && !isMemcmp && !isStrncmp && !isStrcasecmp &&
-                !isStrncasecmp && !isIntMemcpy && !isStdString)
+                !isStrncasecmp && !isIntMemcpy && !isStdString && !isStrstr &&
+                !isGStrstrLen)
               continue;
 
-            /* is a str{n,}{case,}cmp/memcmp, check if we have
+            /* is a str{n,}{case,}cmp/memcmp/strstr, check if we have
              * str{case,}cmp(x, "const") or str{case,}cmp("const", x)
              * strn{case,}cmp(x, "const", ..) or strn{case,}cmp("const", x, ..)
-             * memcmp(x, "const", ..) or memcmp("const", x, ..) */
+             * memcmp(x, "const", ..) or memcmp("const", x, ..)
+             * strstr(x, "const") or g_strstr_len(x, len, "const") */
             Value *Str1P = callInst->getArgOperand(0),
-                  *Str2P = callInst->getArgOperand(1);
+                  // g_strstr_len needle is arg2; all others use arg1
+                *Str2P = isGStrstrLen ? callInst->getArgOperand(2)
+                                      : callInst->getArgOperand(1);
             std::string Str1, Str2;
             StringRef   TmpStr;
             bool        HasStr1 = getConstantStringInfo(Str1P, TmpStr);
@@ -745,18 +1034,18 @@ bool ModuleSanitizerCoverage::instrumentModule(
             else
               Str2 = TmpStr.str();
 
-            if (debug)
+            /*if (debug)
               fprintf(stderr, "F:%s %p(%s)->\"%s\"(%s) %p(%s)->\"%s\"(%s)\n",
                       FuncName.c_str(), Str1P, Str1P->getName().str().c_str(),
                       Str1.c_str(), HasStr1 == true ? "true" : "false", Str2P,
                       Str2P->getName().str().c_str(), Str2.c_str(),
-                      HasStr2 == true ? "true" : "false");
+                      HasStr2 == true ? "true" : "false");*/
 
             // we handle the 2nd parameter first because of llvm memcpy
             if (!HasStr2) {
 
               auto *Ptr = dyn_cast<ConstantExpr>(Str2P);
-              if (Ptr && Ptr->isGEPWithNoNotionalOverIndexing()) {
+              if (Ptr && Ptr->getOpcode() == Instruction::GetElementPtr) {
 
                 if (auto *Var = dyn_cast<GlobalVariable>(Ptr->getOperand(0))) {
 
@@ -784,7 +1073,7 @@ bool ModuleSanitizerCoverage::instrumentModule(
 
               if (HasStr2 == true) {
 
-                Value *      op2 = callInst->getArgOperand(2);
+                Value       *op2 = callInst->getArgOperand(2);
                 ConstantInt *ilen = dyn_cast<ConstantInt>(op2);
                 if (ilen) {
 
@@ -799,7 +1088,6 @@ bool ModuleSanitizerCoverage::instrumentModule(
                   if (literalLength + 1 == optLength) {
 
                     Str2.append("\0", 1);  // add null byte
-                    // addedNull = true;
 
                   }
 
@@ -838,7 +1126,7 @@ bool ModuleSanitizerCoverage::instrumentModule(
 
               auto Ptr = dyn_cast<ConstantExpr>(Str1P);
 
-              if (Ptr && Ptr->isGEPWithNoNotionalOverIndexing()) {
+              if (Ptr && Ptr->getOpcode() == Instruction::GetElementPtr) {
 
                 if (auto *Var = dyn_cast<GlobalVariable>(Ptr->getOperand(0))) {
 
@@ -892,7 +1180,7 @@ bool ModuleSanitizerCoverage::instrumentModule(
 
             if (isMemcmp || isStrncmp || isStrncasecmp) {
 
-              Value *      op2 = callInst->getArgOperand(2);
+              Value       *op2 = callInst->getArgOperand(2);
               ConstantInt *ilen = dyn_cast<ConstantInt>(op2);
 
               if (ilen) {
@@ -907,8 +1195,8 @@ bool ModuleSanitizerCoverage::instrumentModule(
 
                 if (optLen < 2) { continue; }
                 if (literalLength + 1 == optLen) {  // add null byte
+
                   thestring.append("\0", 1);
-                  addedNull = true;
 
                 }
 
@@ -920,14 +1208,18 @@ bool ModuleSanitizerCoverage::instrumentModule(
             // was not already added
             if (!isMemcmp) {
 
-              if (addedNull == false && thestring[optLen - 1] != '\0') {
+              /*
+                            if (addedNull == false && thestring[optLen - 1] !=
+                 '\0') {
 
-                thestring.append("\0", 1);  // add null byte
-                optLen++;
+                              thestring.append("\0", 1);  // add null byte
+                              ++optLen;
 
-              }
+                            }
 
-              if (!isStdString) {
+              */
+              if (!isStdString &&
+                  thestring.find('\0', 0) != std::string::npos) {
 
                 // ensure we do not have garbage
                 size_t offset = thestring.find('\0', 0);
@@ -943,7 +1235,7 @@ bool ModuleSanitizerCoverage::instrumentModule(
               std::string outstring;
               fprintf(stderr, "%s: length %zu/%zu \"", FuncName.c_str(), optLen,
                       thestring.length());
-              for (uint8_t i = 0; i < thestring.length(); i++) {
+              for (uint16_t i = 0; i < (uint16_t)thestring.length(); i++) {
 
                 uint8_t c = thestring[i];
                 if (c <= 32 || c >= 127)
@@ -978,10 +1270,8 @@ bool ModuleSanitizerCoverage::instrumentModule(
 
   }
 
-  // afl++ END
+  // AFL++ END
 
-  SanCovTracePCIndir =
-      M.getOrInsertFunction(SanCovTracePCIndirName, VoidTy, IntptrTy);
   // Make sure smaller parameters are zero-extended to i64 as required by the
   // x86_64 ABI.
   AttributeList SanCovTraceCmpZeroExtAL;
@@ -1002,15 +1292,11 @@ bool ModuleSanitizerCoverage::instrumentModule(
   for (auto &F : M)
     instrumentFunction(F, DTCallback, PDTCallback);
 
-  // afl++ START
-  if (documentFile) {
+  // AFL++ START
+  if (dFile.is_open()) dFile.close();
 
-    fclose(documentFile);
-    documentFile = NULL;
-
-  }
-
-  if (!getenv("AFL_LLVM_LTO_DONTWRITEID") || dictionary.size() || map_addr) {
+  if (!getenv("AFL_LLVM_LTO_SKIPINIT") &&
+      (!getenv("AFL_LLVM_LTO_DONTWRITEID") || dictionary.size() || map_addr)) {
 
     // yes we could create our own function, insert it into ctors ...
     // but this would be a pain in the butt ... so we use afl-llvm-rt-lto.o
@@ -1041,12 +1327,12 @@ bool ModuleSanitizerCoverage::instrumentModule(
 
     if (map_addr) {
 
-      GlobalVariable *AFLMapAddrFixed = new GlobalVariable(
-          M, Int64Tyi, true, GlobalValue::ExternalLinkage, 0, "__afl_map_addr");
+      GlobalVariable *AFLMapAddrFixed =
+          new GlobalVariable(M, Int64Tyi, false, GlobalValue::ExternalLinkage,
+                             0, "__afl_map_addr");
       ConstantInt *MapAddr = ConstantInt::get(Int64Tyi, map_addr);
-      StoreInst *  StoreMapAddr = IRB.CreateStore(MapAddr, AFLMapAddrFixed);
-      StoreMapAddr->setMetadata(M.getMDKindID("nosanitize"),
-                                MDNode::get(Ctx, None));
+      StoreInst   *StoreMapAddr = IRB.CreateStore(MapAddr, AFLMapAddrFixed);
+      setNoSanitizeMetadata(StoreMapAddr);
 
     }
 
@@ -1054,22 +1340,23 @@ bool ModuleSanitizerCoverage::instrumentModule(
 
       uint32_t write_loc = afl_global_id;
 
-      if (afl_global_id % 8) write_loc = (((afl_global_id + 8) >> 3) << 3);
+      write_loc = (((afl_global_id + 8) >> 3) << 3);
 
-      GlobalVariable *AFLFinalLoc =
-          new GlobalVariable(M, Int32Tyi, true, GlobalValue::ExternalLinkage, 0,
-                             "__afl_final_loc");
+      // Define __afl_final_loc as a strong global with a static initializer
+      // (load-time value) instead of a runtime store inside a constructor.
+      // afl-compiler-rt.o has a tentative (common) definition that gets
+      // overridden at link time. This guarantees the value is set before any
+      // constructor runs, which matters on macOS where mod_init_func ordering
+      // does not honor cross-translation-unit constructor priorities.
       ConstantInt *const_loc = ConstantInt::get(Int32Tyi, write_loc);
-      StoreInst *  StoreFinalLoc = IRB.CreateStore(const_loc, AFLFinalLoc);
-      StoreFinalLoc->setMetadata(M.getMDKindID("nosanitize"),
-                                 MDNode::get(Ctx, None));
+      new GlobalVariable(M, Int32Tyi, false, GlobalValue::ExternalLinkage,
+                         const_loc, "__afl_final_loc");
 
     }
 
     if (dictionary.size()) {
 
       size_t memlen = 0, count = 0, offset = 0;
-      char * ptr;
 
       // sort and unique the dictionary
       std::sort(dictionary.begin(), dictionary.end());
@@ -1079,23 +1366,17 @@ bool ModuleSanitizerCoverage::instrumentModule(
       for (auto token : dictionary) {
 
         memlen += token.length();
-        count++;
+        ++count;
 
       }
 
       if (!be_quiet)
-        printf("AUTODICTIONARY: %lu string%s found\n", count,
+        printf("AUTODICTIONARY: %zu string%s found\n", count,
                count == 1 ? "" : "s");
 
       if (count) {
 
-        if ((ptr = (char *)malloc(memlen + count)) == NULL) {
-
-          fprintf(stderr, "Error: malloc for %lu bytes failed!\n",
-                  memlen + count);
-          exit(-1);
-
-        }
+        auto ptrhld = std::unique_ptr<char[]>(new char[memlen + count]);
 
         count = 0;
 
@@ -1103,10 +1384,10 @@ bool ModuleSanitizerCoverage::instrumentModule(
 
           if (offset + token.length() < 0xfffff0 && count < MAX_AUTO_EXTRAS) {
 
-            ptr[offset++] = (uint8_t)token.length();
-            memcpy(ptr + offset, token.c_str(), token.length());
+            ptrhld.get()[offset++] = (uint8_t)token.length();
+            memcpy(ptrhld.get() + offset, token.c_str(), token.length());
             offset += token.length();
-            count++;
+            ++count;
 
           }
 
@@ -1117,29 +1398,25 @@ bool ModuleSanitizerCoverage::instrumentModule(
                                0, "__afl_dictionary_len");
         ConstantInt *const_len = ConstantInt::get(Int32Tyi, offset);
         StoreInst *StoreDictLen = IRB.CreateStore(const_len, AFLDictionaryLen);
-        StoreDictLen->setMetadata(M.getMDKindID("nosanitize"),
-                                  MDNode::get(Ctx, None));
+        setNoSanitizeMetadata(StoreDictLen);
 
         ArrayType *ArrayTy = ArrayType::get(IntegerType::get(Ctx, 8), offset);
+        ArrayRef<char>  DictData(ptrhld.get(), offset);
         GlobalVariable *AFLInternalDictionary = new GlobalVariable(
             M, ArrayTy, true, GlobalValue::ExternalLinkage,
-            ConstantDataArray::get(Ctx,
-                                   *(new ArrayRef<char>((char *)ptr, offset))),
-            "__afl_internal_dictionary");
-        AFLInternalDictionary->setInitializer(ConstantDataArray::get(
-            Ctx, *(new ArrayRef<char>((char *)ptr, offset))));
+            ConstantDataArray::get(Ctx, DictData), "__afl_internal_dictionary");
+        AFLInternalDictionary->setInitializer(
+            ConstantDataArray::get(Ctx, DictData));
         AFLInternalDictionary->setConstant(true);
 
-        GlobalVariable *AFLDictionary = new GlobalVariable(
-            M, PointerType::get(Int8Tyi, 0), false,
-            GlobalValue::ExternalLinkage, 0, "__afl_dictionary");
+        GlobalVariable *AFLDictionary =
+            new GlobalVariable(M, PtrTy, false, GlobalValue::ExternalLinkage, 0,
+                               "__afl_dictionary");
 
-        Value *AFLDictOff = IRB.CreateGEP(AFLInternalDictionary, Zero);
-        Value *AFLDictPtr =
-            IRB.CreatePointerCast(AFLDictOff, PointerType::get(Int8Tyi, 0));
+        Value *AFLDictOff = IRB.CreateGEP(Int8Ty, AFLInternalDictionary, Zero);
+        Value *AFLDictPtr = IRB.CreatePointerCast(AFLDictOff, PtrTy);
         StoreInst *StoreDict = IRB.CreateStore(AFLDictPtr, AFLDictionary);
-        StoreDict->setMetadata(M.getMDKindID("nosanitize"),
-                               MDNode::get(Ctx, None));
+        setNoSanitizeMetadata(StoreDict);
 
       }
 
@@ -1155,22 +1432,88 @@ bool ModuleSanitizerCoverage::instrumentModule(
       WARNF("No instrumentation targets found.");
     else {
 
-      char modeline[100];
-      snprintf(modeline, sizeof(modeline), "%s%s%s%s%s",
+      char modeline[128];
+      snprintf(modeline, sizeof(modeline), "%s%s%s%s%s%s",
                getenv("AFL_HARDEN") ? "hardened" : "non-hardened",
                getenv("AFL_USE_ASAN") ? ", ASAN" : "",
                getenv("AFL_USE_MSAN") ? ", MSAN" : "",
+               getenv("AFL_USE_TSAN") ? ", TSAN" : "",
                getenv("AFL_USE_CFISAN") ? ", CFISAN" : "",
                getenv("AFL_USE_UBSAN") ? ", UBSAN" : "");
-      OKF("Instrumented %u locations with no collisions (on average %llu "
-          "collisions would be in afl-gcc/vanilla AFL) (%s mode).",
-          inst, calculateCollisions(inst), modeline);
+      char   buf[160] = {};
+      char  *p = buf;
+      size_t left = sizeof(buf);
+      if (instrument_ctx) {
+
+        int n = snprintf(p, left, " with %u extra map entries for CTX",
+                         extra_ctx_inst);
+        if (n > 0 && (size_t)n < left) {
+
+          p += n;
+          left -= n;
+
+        }
+
+      }
+
+      if (path_mode) {
+
+        int n = snprintf(p, left, " with %llu extra map entries for PATH",
+                         (unsigned long long)extra_path_inst);
+        if (n > 0 && (size_t)n < left) {
+
+          p += n;
+          left -= n;
+
+        }
+
+        if (path_skipped_funcs) {
+
+          n = snprintf(p, left, " (%u funcs skipped)", path_skipped_funcs);
+          if (n > 0 && (size_t)n < left) {
+
+            p += n;
+            left -= n;
+
+          }
+
+        }
+
+      }
+
+      OKF("Instrumented %u locations (%u branchless)%s (%s mode).", inst,
+          decision_cnt, buf, modeline);
+
+      if (getenv("AFL_LLVM_IJON")) {
+
+        if (uses_ijon_functions) {
+
+          if (uses_ijon_state) {
+
+            OKF("IJON state-aware coverage enabled for all instrumented "
+                "locations (IJON_STATE detected).");
+
+          } else {
+
+            OKF("IJON data tracking enabled for instrumented locations "
+                "(IJON_DATA detected, no state-aware coverage).");
+
+          }
+
+        } else {
+
+          OKF("IJON enabled but no IJON calls detected - using regular "
+              "coverage.");
+
+        }
+
+      }
 
     }
 
   }
 
-  // afl++ END
+  // AFL++ END
 
   // We don't reference these arrays directly in any of our runtime functions,
   // so we need to prevent them from being dead stripped.
@@ -1196,7 +1539,7 @@ static bool isFullDominator(const BasicBlock *BB, const DominatorTree *DT) {
 }
 
 // True if block has predecessors and it postdominates all of them.
-static bool isFullPostDominator(const BasicBlock *       BB,
+static bool isFullPostDominator(const BasicBlock        *BB,
                                 const PostDominatorTree *PDT) {
 
   if (pred_begin(BB) == pred_end(BB)) return false;
@@ -1211,10 +1554,59 @@ static bool isFullPostDominator(const BasicBlock *       BB,
 
 }
 
+static void markPersistentLoopEdges(Function &F) {
+
+  SmallVector<BasicBlock *, 8> edges;
+
+  for (auto &BB : F) {
+
+    bool calls_loop = false;
+    for (auto &IN : BB) {
+
+      CallInst *call = dyn_cast<CallInst>(&IN);
+      if (!call) continue;
+      Function *callee = call->getCalledFunction();
+      /* __AFL_LOOP declares the runtime function with an asm label, which on
+         Mach-O carries the extra leading underscore and so shows up in the IR
+         behind LLVM's "\1" no-mangle marker. */
+      if (callee && (callee->getName() == "__afl_persistent_loop" ||
+                     callee->getName() == "\1___afl_persistent_loop")) {
+
+        calls_loop = true;
+        break;
+
+      }
+
+    }
+
+    if (!calls_loop) continue;
+
+    for (BasicBlock *succ : successors(&BB)) {
+
+      if (succ->getSinglePredecessor() != &BB) continue;
+      Instruction *term = succ->getTerminator();
+      BranchInst  *br = dyn_cast<BranchInst>(term);
+      if (!br || !br->isUnconditional()) continue;
+      if (&*succ->getFirstNonPHIOrDbg() != term) continue;
+      edges.push_back(succ);
+
+    }
+
+  }
+
+  for (BasicBlock *BB : edges)
+    BB->getTerminator()->setMetadata("afl.skip",
+                                     MDNode::get(BB->getContext(), {}));
+
+}
+
 static bool shouldInstrumentBlock(const Function &F, const BasicBlock *BB,
-                                  const DominatorTree *           DT,
-                                  const PostDominatorTree *       PDT,
+                                  const DominatorTree            *DT,
+                                  const PostDominatorTree        *PDT,
                                   const SanitizerCoverageOptions &Options) {
+
+  if (const Instruction *term = BB->getTerminator())
+    if (term->getMetadata("afl.skip")) return false;
 
   // Don't insert coverage for blocks containing nothing but unreachable: we
   // will never call __sanitizer_cov() for them, so counting them in
@@ -1227,10 +1619,13 @@ static bool shouldInstrumentBlock(const Function &F, const BasicBlock *BB,
   // (catchswitch blocks).
   if (BB->getFirstInsertionPt() == BB->end()) return false;
 
-  // afl++ START
+  if (&F.getEntryBlock() != BB && isFullyArtificialBlock(BB)) return false;
+  if (isAflSyntheticBlock(BB)) return false;
+
+  // AFL++ START
   if (!Options.NoPrune && &F.getEntryBlock() == BB && F.size() > 1)
     return false;
-  // afl++ END
+  // AFL++ END
 
   if (Options.NoPrune || &F.getEntryBlock() == BB) return true;
 
@@ -1245,13 +1640,63 @@ static bool shouldInstrumentBlock(const Function &F, const BasicBlock *BB,
 
 }
 
-void ModuleSanitizerCoverage::instrumentFunction(
+/// return the number of calls to this function
+u32 countCallers(Function *F) {
+
+  u32 callers = 0;
+
+  if (!F) { return 0; }
+
+  for (auto *U : F->users()) {
+
+    if (isa<CallInst>(U) || isa<InvokeInst>(U)) { ++callers; }
+
+  }
+
+  return callers;
+
+}
+
+/// return the calling function of a function - only if there is a single caller
+Function *returnOnlyCaller(Function *F) {
+
+  Function *caller = NULL;
+
+  if (!F) { return NULL; }
+
+  for (auto *U : F->users()) {
+
+    if (auto *CB = dyn_cast<CallBase>(U)) {
+
+      if (caller == NULL) {
+
+        caller = CB->getParent()->getParent();
+
+      } else {
+
+        return NULL;
+
+      }
+
+    }
+
+  }
+
+  return caller;
+
+}
+
+void ModuleSanitizerCoverageLTO::instrumentFunction(
     Function &F, DomTreeCallback DTCallback, PostDomTreeCallback PDTCallback) {
 
   if (F.empty()) return;
-  if (F.getName().find(".module_ctor") != std::string::npos)
+  if (F.getName().contains(".module_ctor"))
     return;  // Should not instrument sanitizer init functions.
+#if LLVM_VERSION_MAJOR >= 18
+  if (F.getName().starts_with("__sanitizer_"))
+#else
   if (F.getName().startswith("__sanitizer_"))
+#endif
     return;  // Don't instrument __sanitizer_* callbacks.
   // Don't touch available_externally functions, their actual body is elsewhere.
   if (F.getLinkage() == GlobalValue::AvailableExternallyLinkage) return;
@@ -1267,55 +1712,65 @@ void ModuleSanitizerCoverage::instrumentFunction(
   if (F.hasPersonalityFn() &&
       isAsynchronousEHPersonality(classifyEHPersonality(F.getPersonalityFn())))
     return;
+  if (F.hasFnAttribute(Attribute::NoSanitizeCoverage)) return;
+#if LLVM_VERSION_MAJOR >= 19
+  if (F.hasFnAttribute(Attribute::DisableSanitizerInstrumentation)) return;
+#endif
   // if (Allowlist && !Allowlist->inSection("coverage", "fun", F.getName()))
   //  return;
   // if (Blocklist && Blocklist->inSection("coverage", "fun", F.getName()))
   // return;
 
-  // afl++ START
+  // AFL++ START
   if (!F.size()) return;
-  if (!isInInstrumentList(&F)) return;
-  // afl++ END
 
-  if (Options.CoverageType >= SanitizerCoverageOptions::SCK_Edge)
-    SplitAllCriticalEdges(
-        F, CriticalEdgeSplittingOptions().setIgnoreUnreachableDests());
-  SmallVector<Instruction *, 8> IndirCalls;
-  SmallVector<BasicBlock *, 16> BlocksToInstrument;
+  LLVMContext &Context = F.getContext();
+  MDNode      *N = MDNode::get(Context, MDString::get(Context, "nosanitize"));
 
-  const DominatorTree *    DT = DTCallback(F);
-  const PostDominatorTree *PDT = PDTCallback(F);
-  bool                     IsLeafFunc = true;
+  if (instrument_ctx) {
 
-  for (auto &BB : F) {
+    // we have to set __afl_ctx 0 for all indirect calls in all functions, even
+    // those not to be instrumented.
 
-    for (auto &IN : BB) {
+    // AFL++ START
+    if (deny_exec) {
 
-      CallInst *callInst = nullptr;
+      FunctionCallee AbortFn = F.getParent()->getOrInsertFunction(
+          "abort", AttributeList{}, Type::getVoidTy(Context));
+      for (auto &BB : F) {
 
-      if ((callInst = dyn_cast<CallInst>(&IN))) {
+        for (auto &IN : BB) {
 
-        Function *Callee = callInst->getCalledFunction();
-        if (!Callee) continue;
-        if (callInst->getCallingConv() != llvm::CallingConv::C) continue;
-        StringRef FuncName = Callee->getName();
-        if (FuncName.compare(StringRef("__afl_coverage_interesting"))) continue;
+          if (isExecCall(&IN)) {
 
-        Value *val = ConstantInt::get(Int32Ty, ++afl_global_id);
-        callInst->setOperand(1, val);
+            IRBuilder<> IRB(&IN);
+            IRB.CreateCall(AbortFn);
+
+          }
+
+        }
 
       }
 
     }
 
-    if (shouldInstrumentBlock(F, &BB, DT, PDT, Options))
-      BlocksToInstrument.push_back(&BB);
-    for (auto &Inst : BB) {
+    // AFL++ END
+    for (auto &BB : F) {
 
-      if (Options.IndirectCalls) {
+      for (auto &IN : BB) {
 
-        CallBase *CB = dyn_cast<CallBase>(&Inst);
-        if (CB && !CB->getCalledFunction()) IndirCalls.push_back(&Inst);
+        if (auto *Call = dyn_cast<CallInst>(&IN)) {
+
+          if (Call->isIndirectCall()) {
+
+            IRBuilder<> Builder(IN.getContext());
+            Builder.SetInsertPoint(IN.getParent(), IN.getIterator());
+            StoreInst *StoreCtx = Builder.CreateStore(Zero32, AFLContext);
+            StoreCtx->setMetadata("nosanitize", N);
+
+          }
+
+        }
 
       }
 
@@ -1323,12 +1778,909 @@ void ModuleSanitizerCoverage::instrumentFunction(
 
   }
 
+  if (!isInInstrumentList(&F, FMNAME)) return;
+  // AFL++ END
+
+  if (reachability_mode) {
+
+    instrumentReachability(F, getReachabilityValue(reachabilityValues, F));
+
+  }
+
+  if (Options.CoverageType >= SanitizerCoverageOptions::SCK_Edge)
+    SplitAllCriticalEdges(
+        F, CriticalEdgeSplittingOptions().setIgnoreUnreachableDests());
+
+  markPersistentLoopEdges(F);
+
+  SmallVector<Instruction *, 8> IndirCalls;
+  SmallVector<BasicBlock *, 16> BlocksToInstrument;
+
+  const DominatorTree     *DT = DTCallback(F);
+  const PostDominatorTree *PDT = PDTCallback(F);
+  bool                     IsLeafFunc = true;
+  uint32_t                 call_counter = 0, call_depth = 0;
+  uint32_t                 inst_save = inst, save_global = afl_global_id;
+  uint32_t                 inst_in_this_func = 0;
+  Function                *caller = NULL;
+  LoadInst                *PrevCtxLoad = NULL;
+
+  CTX_add = NULL;
+
+  if (debug) fprintf(stderr, "Function: %s\n", F.getName().str().c_str());
+
+  if (instrument_ctx) {
+
+    caller = &F;
+    call_counter = countCallers(caller);
+    Function *callee = caller;
+
+    if (call_counter == 1 && instrument_ctx_max_depth) {
+
+      ++call_depth;
+
+      // returnOnlyCaller() returns non-NULL only when callee has exactly
+      // one caller, so the loop walks up the chain through single-caller
+      // functions and stops at the first ancestor with !=1 callers or
+      // when the depth budget is exhausted.
+      while (instrument_ctx_max_depth >= call_depth &&
+             (caller = returnOnlyCaller(callee)) != NULL) {
+
+        if (debug)
+          fprintf(stderr, "DEBUG: another depth: %s <- %s [%u]\n",
+                  callee->getName().str().c_str(),
+                  caller->getName().str().c_str(), call_depth);
+        ++call_depth;
+        callee = caller;
+
+      }
+
+      if (!caller && callee) { caller = callee; }
+
+      // Refresh call_counter for the function we actually landed on; on
+      // depth-limit exit it would otherwise still hold the previous
+      // ancestor's count (always 1, which is what allowed us to keep
+      // walking), causing the call_counter==1 reset below to wipe a
+      // perfectly good multi-caller ancestor.
+      if (caller) call_counter = countCallers(caller);
+
+      if (debug)
+        fprintf(stderr, "DEBUG: depth found: %s <- %s [count=%u, depth=%u]\n",
+                caller ? caller->getName().str().c_str() : "(null)",
+                F.getName().str().c_str(), call_counter, call_depth);
+
+    }
+
+    if (debug && call_counter < 2) {
+
+      fprintf(stderr, "Function %s only %u (%s)\n", F.getName().str().c_str(),
+              call_counter, caller->getName().str().c_str());
+
+    }
+
+    if (call_counter == 1) {
+
+      call_counter = 0;
+      caller = NULL;
+
+    }
+
+    if (debug) {
+
+      fprintf(stderr, "DEBUG: result: Function=%s callers=%u depth=%u\n",
+              F.getName().str().c_str(), call_counter, call_depth);
+
+    }
+
+    if (call_counter > 1) {
+
+      // Fake instrumentation so we can count how many instrumentations there
+      // will be in this function
+      for (auto &BB : F) {
+
+        for (auto &IN : BB) {
+
+          CallInst *callInst = nullptr;
+
+          if ((callInst = dyn_cast<CallInst>(&IN)) &&
+              !isAflCovMinMaxIntrinsic(IN)) {
+
+            Function *Callee = callInst->getCalledFunction();
+            if (!Callee) continue;
+            if (Callee->isIntrinsic()) continue;
+            if (callInst->getCallingConv() != llvm::CallingConv::C) continue;
+            StringRef FuncName = Callee->getName();
+
+            if (FuncName.compare(StringRef("__afl_coverage_interesting")))
+              continue;
+
+            ++inst;
+
+          }
+
+          if (!isAflCovInterestingInstruction(IN)) continue;
+
+          if (auto *selectInst = dyn_cast<SelectInst>(&IN)) {
+
+            Value *condition = selectInst->getCondition();
+            auto   t = condition->getType();
+
+            if (t->getTypeID() == llvm::Type::IntegerTyID) {
+
+              inst += 2;
+
+            } else
+
+                if (t->getTypeID() == llvm::Type::FixedVectorTyID) {
+
+              FixedVectorType *tt = dyn_cast<FixedVectorType>(t);
+              if (tt) {
+
+                uint32_t elements = tt->getElementCount().getFixedValue();
+                inst += elements * 2;
+
+              }
+
+            } else
+
+                if (t->getTypeID() == llvm::Type::ScalableVectorTyID) {
+
+              // Scalable vectors: OR-reduce to scalar at instrumentation time
+              inst += 2;
+
+            } else
+
+            {
+
+              continue;
+
+            }
+
+          } else if (auto *icmp = dyn_cast<ICmpInst>(&IN)) {
+
+            if (icmp->getType()->isIntegerTy(1)) inst += 2;
+
+          } else if (auto *fcmp = dyn_cast<FCmpInst>(&IN)) {
+
+            if (fcmp->getType()->isIntegerTy(1)) inst += 2;
+
+          } else if (dyn_cast<AtomicCmpXchgInst>(&IN)) {
+
+            inst += 2;
+
+          } else if (auto *rmw = dyn_cast<AtomicRMWInst>(&IN)) {
+
+            auto Op = rmw->getOperation();
+            if (Op == AtomicRMWInst::Min || Op == AtomicRMWInst::Max ||
+                Op == AtomicRMWInst::UMin || Op == AtomicRMWInst::UMax)
+              inst += 2;
+
+          } else if (isAflCovMinMaxIntrinsic(IN)) {
+
+            Type            *mmt = IN.getType();
+            FixedVectorType *mmv = dyn_cast<FixedVectorType>(mmt);
+
+            if (mmt->isIntegerTy() || mmt->isFloatingPointTy()) {
+
+              inst += 2;
+
+            } else if (isAflCovVectorEnabled()) {
+
+              if (mmv) {
+
+                inst += mmv->getElementCount().getKnownMinValue() * 2;
+
+              } else if (mmt->getTypeID() == llvm::Type::ScalableVectorTyID) {
+
+                inst += 2;
+
+              }
+
+            }
+
+          }
+
+        }
+
+        if (shouldInstrumentBlock(F, &BB, DT, PDT, Options))
+          BlocksToInstrument.push_back(&BB);
+
+      }
+
+      Fake_InjectCoverage(F, BlocksToInstrument, IsLeafFunc);
+
+      if (debug)
+        fprintf(stderr, "DEBUG: CTX: %u instrumentations\n", inst - inst_save);
+
+      // we only instrument functions that have more than one instrumented block
+      if (inst > inst_save + 1) {
+
+        inst_in_this_func = inst - inst_save;
+        bool done = false;
+
+        // in rare occasions there can be multiple entry points per function
+        for (auto &BB : F) {
+
+          if (&BB == &F.getEntryBlock() && done == false) {
+
+            // we insert a CTX value in all our callers:
+            IRBuilder<> Builder(Context);
+            CallInst   *CI = NULL;
+            Function   *F2 = NULL;
+            uint32_t    instrumented_calls = 0;
+
+            for (auto *U : caller->users()) {
+
+              if ((CI = dyn_cast<CallInst>(U))) {
+
+                F2 = CI->getParent()->getParent();
+                if (debug)
+                  fprintf(stderr,
+                          "DEBUG: CTX call insert %s [%u/%u] -> %s/%s\n",
+                          F2->getName().str().c_str(), instrumented_calls + 1,
+                          call_counter, caller->getName().str().c_str(),
+                          F.getName().str().c_str());
+
+                Builder.SetInsertPoint(CI);
+                StoreInst *StoreCtx = Builder.CreateStore(
+                    ConstantInt::get(Type::getInt32Ty(Context),
+                                     instrumented_calls++),
+                    AFLContext);
+                StoreCtx->setMetadata("nosanitize", N);
+
+              }
+
+            }
+
+            if (instrumented_calls != call_counter) {
+
+              fprintf(stderr, "BUG! %s/%s <=> %u vs %u\n",
+                      caller->getName().str().c_str(),
+                      F.getName().str().c_str(), instrumented_calls,
+                      call_counter);
+              exit(-1);
+
+            }
+
+            done = true;
+
+          }
+
+          // in all entrypoints we have to load the CTX value
+          if (&BB == &F.getEntryBlock()) {
+
+            Value               *CTX_offset;
+            BasicBlock::iterator IP = BB.getFirstInsertionPt();
+            IRBuilder<>          IRB(&(*IP));
+
+            PrevCtxLoad = IRB.CreateLoad(IRB.getInt32Ty(), AFLContext);
+            PrevCtxLoad->setMetadata("nosanitize", N);
+
+            CTX_offset = IRB.CreateMul(
+                ConstantInt::get(Type::getInt32Ty(Context), inst_in_this_func),
+                PrevCtxLoad, "CTXmul", false, true);
+
+            CTX_add =
+                IRB.CreateAlloca(Type::getInt32Ty(Context), nullptr, "CTX_add");
+            auto nosan = IRB.CreateStore(CTX_offset, CTX_add);
+            nosan->setMetadata("nosanitize", N);
+
+            if (debug)
+              fprintf(
+                  stderr, "DEBUG: extra CTX instrumentations for %s: %u * %u\n",
+                  F.getName().str().c_str(), inst - inst_save, call_counter);
+
+          }
+
+          for (auto &IN : BB) {
+
+            // check all calls and where callee count == 1 instrument
+            // our current caller_id to __afl_ctx
+            if (auto callInst = dyn_cast<CallInst>(&IN)) {
+
+              Function *Callee = callInst->getCalledFunction();
+              if (!Callee) continue;
+              if (Callee->isIntrinsic()) continue;
+              if (countCallers(Callee) == 1) {
+
+                if (debug)
+                  fprintf(stderr, "DEBUG: %s call to %s with only one caller\n",
+                          F.getName().str().c_str(),
+                          Callee->getName().str().c_str());
+
+                IRBuilder<> Builder(IN.getContext());
+                Builder.SetInsertPoint(callInst);
+                StoreInst *StoreCtx =
+                    Builder.CreateStore(PrevCtxLoad, AFLContext);
+                StoreCtx->setMetadata("nosanitize", N);
+
+              }
+
+            }
+
+          }
+
+        }
+
+      }
+
+    }
+
+    inst = inst_save;
+
+    /* if (debug)
+       fprintf(stderr, "Next instrumentation (%u-%u=%u %u-%u=%u)\n", inst,
+               inst_save, inst - inst_save, afl_global_id, save_global,
+               afl_global_id - save_global);*/
+
+  }
+
+  auto applyCtxOffset = [&](IRBuilder<> &IRB, Value *V) -> Value * {
+
+    if (!CTX_add) return V;
+    LoadInst *CTX_load = IRB.CreateLoad(IRB.getInt32Ty(), CTX_add);
+    setNoSanitizeMetadata(CTX_load);
+    return IRB.CreateAdd(V, CTX_load);
+
+  };
+
+  auto markAflSkip = [&](Value *V) {
+
+    if (auto *InstV = dyn_cast<Instruction>(V)) {
+
+      LLVMContext &Ctx = InstV->getContext();
+      InstV->setMetadata("afl.skip", MDNode::get(Ctx, {}));
+
+    }
+
+  };
+
+  auto updateBitmapForResult = [&](IRBuilder<> &IRB, Value *Result,
+                                   uint32_t vector_cnt) {
+
+    Value *EffMapPtr = HoistedMapPtr;
+    if (!EffMapPtr) {
+
+      auto *L = IRB.CreateLoad(PtrTy, AFLMapPtr);
+      setNoSanitizeMetadata(L);
+      EffMapPtr = L;
+
+    }
+
+    uint32_t vector_cur = 0;
+
+    while (1) {
+
+      Value *MapPtrIdx = nullptr;
+      Value *CoverageIndex = nullptr;
+
+      if (!vector_cnt) {
+
+        CoverageIndex = Result;
+
+      } else {
+
+        CoverageIndex = IRB.CreateExtractElement(Result, vector_cur++);
+
+      }
+
+      // Apply IJON state-aware coverage if enabled
+      if (ijon_enabled && AFLIJONState) {
+
+        LoadInst *IJONStateVal = IRB.CreateLoad(Int32Tyi, AFLIJONState);
+        setNoSanitizeMetadata(IJONStateVal);
+        Value    *XorResult = IRB.CreateXor(IJONStateVal, CoverageIndex);
+        LoadInst *CovMapSize = IRB.CreateLoad(Int32Tyi, AFLCovMapSize);
+        setNoSanitizeMetadata(CovMapSize);
+        CoverageIndex = IRB.CreateURem(XorResult, CovMapSize);
+
+      }
+
+      MapPtrIdx = IRB.CreateGEP(Int8Ty, EffMapPtr, CoverageIndex);
+
+      if (use_threadsafe_counters) {
+
+        auto result = IRB.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp::Add,
+                                          MapPtrIdx, One, llvm::MaybeAlign(1),
+                                          llvm::AtomicOrdering::Monotonic);
+
+        markAflSkip(result);
+
+      } else {
+
+        LoadInst *Counter = IRB.CreateLoad(IRB.getInt8Ty(), MapPtrIdx);
+        setNoSanitizeMetadata(Counter);
+
+        Value *Incr = IRB.CreateAdd(Counter, One);
+
+        if (skip_nozero == NULL) {
+
+          Incr = IRB.CreateBinaryIntrinsic(Intrinsic::umax, Incr, One);
+          markAflSkip(Incr);
+
+        }
+
+        auto nosan = IRB.CreateStore(Incr, MapPtrIdx);
+        setNoSanitizeMetadata(nosan);
+
+      }
+
+      if (!vector_cnt || vector_cnt == vector_cur) break;
+
+    }
+
+  };
+
+  /* Set up HoistedMapPtr before the select/switch instrumentation loop,
+     because updateBitmapForResult uses it.  InjectCoverage (called later)
+     will reuse the same value.
+     hoistMapPointerLoad inserts a new entry block (preamble) — never
+     instrument that block with code that uses HoistedMapPtr.
+     IMPORTANT: do NOT hoist for coroutines.  This pass runs before
+     CoroSplitPass.  A hoisted load that is used across suspend points gets
+     spilled into the coroutine frame; in the .destroy path the frame is
+     freed first and the spilled value is then read from freed memory →
+     heap-use-after-free. */
+  if (map_addr) {
+
+    HoistedMapPtr = MapPtrFixed;
+
+  } else {
+
+    bool isCoro = false;
+    for (auto &BB : F) {
+
+      for (auto &I : BB) {
+
+        if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+
+          auto iid = II->getIntrinsicID();
+          if (iid == Intrinsic::coro_id || iid == Intrinsic::coro_id_retcon ||
+              iid == Intrinsic::coro_id_retcon_once ||
+              iid == Intrinsic::coro_id_async) {
+
+            isCoro = true;
+            break;
+
+          }
+
+        }
+
+      }
+
+      if (isCoro) break;
+
+    }
+
+    if (!isCoro) {
+
+      HoistedMapPtr = hoistMapPointerLoad(F, AFLMapPtr, PtrTy);
+
+    } else {
+
+      HoistedMapPtr = NULL;
+
+    }
+
+  }
+
+  for (auto &BB : F) {
+
+    for (auto &IN : BB) {
+
+      if (IN.getMetadata("afl.skip")) continue;
+
+      if (auto *callInst = dyn_cast<CallInst>(&IN);
+          callInst && !isAflCovMinMaxIntrinsic(IN)) {
+
+        Function *Callee = callInst->getCalledFunction();
+        if (!Callee) continue;
+        if (Callee->isIntrinsic()) continue;
+        if (callInst->getCallingConv() != llvm::CallingConv::C) continue;
+        StringRef FuncName = Callee->getName();
+        if (!FuncName.compare(StringRef("dlopen")) ||
+            !FuncName.compare(StringRef("_dlopen"))) {
+
+          fprintf(stderr,
+                  "WARNING: dlopen() detected. To have coverage for a library "
+                  "that your target dlopen()'s this must either happen before "
+                  "__AFL_INIT() or you must use AFL_PRELOAD to preload all "
+                  "dlopen()'ed libraries!\n");
+          continue;
+
+        }
+
+        if (FuncName.compare(StringRef("__afl_coverage_interesting"))) continue;
+
+        IRBuilder<> Builder(callInst);
+        Value      *val =
+            applyCtxOffset(Builder, ConstantInt::get(Int32Ty, ++afl_global_id));
+
+        callInst->setOperand(1, val);
+        ++inst;
+
+      }
+
+      if (!isAflCovInterestingInstruction(IN)) continue;
+
+#if 0
+  if (DILocation *Loc = IN.getDebugLoc()) {
+
+    llvm::errs() << "DEBUG " << Loc->getFilename() << ":" << Loc->getLine()
+                 << ":";
+    std::string path =
+        Loc->getDirectory().str() + "/" + Loc->getFilename().str();
+    std::ifstream sourceFile(path);
+    std::string   lineContent;
+    for (unsigned line = 1; line <= Loc->getLine(); ++line)
+      std::getline(sourceFile, lineContent);
+    llvm::errs() << lineContent << "\n";
+
+  }
+
+  errs() << *(&IN) << "\n";
+#endif
+
+      if (auto *selectInst = dyn_cast<SelectInst>(&IN)) {
+
+        uint32_t    vector_cnt = 0;
+        Value      *condition = selectInst->getCondition();
+        Value      *result = nullptr;
+        auto        t = condition->getType();
+        IRBuilder<> IRB(selectInst->getNextNode());
+
+        if (t->getTypeID() == llvm::Type::IntegerTyID) {
+
+          Value *frozen_cond = IRB.CreateFreeze(condition);
+          markAflSkip(frozen_cond);
+          Value *val1 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          Value *val2 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          result = IRB.CreateSelect(frozen_cond, val1, val2);
+          inst += 2;
+
+        } else
+
+            if (t->getTypeID() == llvm::Type::FixedVectorTyID) {
+
+          FixedVectorType *tt = dyn_cast<FixedVectorType>(t);
+          if (tt) {
+
+            uint32_t elements = tt->getElementCount().getFixedValue();
+            vector_cnt = elements;
+            inst += vector_cnt * 2;
+            if (elements) {
+
+              FixedVectorType *GuardPtr1 =
+                  FixedVectorType::get(Int32Ty, elements);
+              FixedVectorType *GuardPtr2 =
+                  FixedVectorType::get(Int32Ty, elements);
+              Value *x, *y;
+
+              Value *val1 = applyCtxOffset(
+                  IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+              Value *val2 = applyCtxOffset(
+                  IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+
+              x = IRB.CreateInsertElement(GuardPtr1, val1, (uint64_t)0);
+              y = IRB.CreateInsertElement(GuardPtr2, val2, (uint64_t)0);
+
+              for (uint64_t i = 1; i < elements; i++) {
+
+                val1 = applyCtxOffset(
+                    IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+                val2 = applyCtxOffset(
+                    IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+
+                x = IRB.CreateInsertElement(x, val1, i);
+                y = IRB.CreateInsertElement(y, val2, i);
+
+              }
+
+              Value *frozen_cond = IRB.CreateFreeze(condition);
+              markAflSkip(frozen_cond);
+              result = IRB.CreateSelect(frozen_cond, x, y);
+
+            }
+
+          }
+
+        } else
+
+            if (t->getTypeID() == llvm::Type::ScalableVectorTyID) {
+
+          // Scalable vectors (SVE/RISC-V V): OR-reduce to scalar i1
+          // since the vector length is runtime-dependent.
+          Value *frozen_cond = IRB.CreateFreeze(condition);
+          markAflSkip(frozen_cond);
+          Value *reduced = IRB.CreateOrReduce(frozen_cond);
+          markAflSkip(reduced);
+          Value *val1 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          Value *val2 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          result = IRB.CreateSelect(reduced, val1, val2);
+          inst += 2;
+
+        } else
+
+        {
+
+          ++unhandled;
+          continue;
+
+        }
+
+        if (!result) continue;
+        markAflSkip(result);
+        updateBitmapForResult(IRB, result, vector_cnt);
+        decision_cnt++;
+
+      } else {
+
+        uint32_t    vector_cnt = 0;
+        Value      *result = nullptr;
+        IRBuilder<> IRB(IN.getNextNode());
+
+        if (auto *icmp = dyn_cast<ICmpInst>(&IN)) {
+
+          if (!icmp->getType()->isIntegerTy(1)) continue;
+
+          Value *res = IRB.CreateFreeze(icmp);
+          markAflSkip(res);
+          Value *val1 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          Value *val2 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          result = IRB.CreateSelect(res, val1, val2);
+          markAflSkip(result);
+          inst += 2;
+
+        } else if (auto *fcmp = dyn_cast<FCmpInst>(&IN)) {
+
+          if (!fcmp->getType()->isIntegerTy(1)) continue;
+
+          Value *res = IRB.CreateFreeze(fcmp);
+          markAflSkip(res);
+          Value *val1 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          Value *val2 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          result = IRB.CreateSelect(res, val1, val2);
+          markAflSkip(result);
+          inst += 2;
+
+        } else if (auto *cxchg = dyn_cast<AtomicCmpXchgInst>(&IN)) {
+
+          Value *extracted = IRB.CreateExtractValue(cxchg, 1);
+          markAflSkip(extracted);
+          Value *res = IRB.CreateFreeze(extracted);
+          markAflSkip(res);
+          Value *val1 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          Value *val2 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          result = IRB.CreateSelect(res, val1, val2);
+          markAflSkip(result);
+          inst += 2;
+
+        } else if (auto *rmw = dyn_cast<AtomicRMWInst>(&IN)) {
+
+          AtomicRMWInst::BinOp Op = rmw->getOperation();
+          if (Op != AtomicRMWInst::Min && Op != AtomicRMWInst::Max &&
+              Op != AtomicRMWInst::UMin && Op != AtomicRMWInst::UMax)
+            continue;
+
+          Value *OldVal = rmw;  // result of atomicrmw: old value
+          Value *NewVal = rmw->getValOperand();  // value passed to atomicrmw
+
+          if (OldVal->getType() != NewVal->getType()) {
+
+            if (NewVal->getType()->isIntegerTy() &&
+                OldVal->getType()->isIntegerTy()) {
+
+              unsigned OldBW = OldVal->getType()->getIntegerBitWidth();
+              unsigned NewBW = NewVal->getType()->getIntegerBitWidth();
+              if (NewBW < OldBW)
+                NewVal = IRB.CreateSExt(NewVal, OldVal->getType(), "rmw.ext");
+              else if (NewBW > OldBW)
+                NewVal =
+                    IRB.CreateTrunc(NewVal, OldVal->getType(), "rmw.trunc");
+
+            }
+
+          }
+
+          CmpInst::Predicate Pred;
+          switch (Op) {
+
+            case AtomicRMWInst::Min:
+              Pred = CmpInst::ICMP_SLT;
+              break;
+            case AtomicRMWInst::Max:
+              Pred = CmpInst::ICMP_SGT;
+              break;
+            case AtomicRMWInst::UMin:
+              Pred = CmpInst::ICMP_ULT;
+              break;
+            case AtomicRMWInst::UMax:
+              Pred = CmpInst::ICMP_UGT;
+              break;
+            default:
+              continue;
+
+          }
+
+          Value *cmp = IRB.CreateICmp(Pred, NewVal, OldVal, "rmw.cov");
+          markAflSkip(cmp);
+          Value *res = IRB.CreateFreeze(cmp);
+          markAflSkip(res);
+          Value *val1 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          Value *val2 =
+              applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+          result = IRB.CreateSelect(res, val1, val2);
+          markAflSkip(result);
+          inst += 2;
+
+        } else if (isAflCovMinMaxIntrinsic(IN)) {
+
+          IntrinsicInst   *mmi = cast<IntrinsicInst>(&IN);
+          Type            *mmt = mmi->getType();
+          FixedVectorType *mmv = dyn_cast<FixedVectorType>(mmt);
+          bool mmscalable = mmt->getTypeID() == llvm::Type::ScalableVectorTyID;
+
+          if (!mmt->isIntegerTy() && !mmt->isFloatingPointTy() &&
+              !((mmv || mmscalable) && isAflCovVectorEnabled()))
+            continue;
+
+          Intrinsic::ID iid = mmi->getIntrinsicID();
+          Value        *lhs = mmi->getArgOperand(0);
+          Value        *rhs = iid == Intrinsic::abs ? ConstantInt::get(mmt, 0)
+                                                    : mmi->getArgOperand(1);
+          Value        *cmp = nullptr;
+
+          switch (iid) {
+
+            case Intrinsic::smin:
+            case Intrinsic::abs:
+              cmp = IRB.CreateICmpSLT(lhs, rhs);
+              break;
+            case Intrinsic::smax:
+              cmp = IRB.CreateICmpSGT(lhs, rhs);
+              break;
+            case Intrinsic::umin:
+              cmp = IRB.CreateICmpULT(lhs, rhs);
+              break;
+            case Intrinsic::umax:
+              cmp = IRB.CreateICmpUGT(lhs, rhs);
+              break;
+            case Intrinsic::minnum:
+            case Intrinsic::minimum:
+              cmp = IRB.CreateFCmpOLT(lhs, rhs);
+              break;
+            case Intrinsic::maxnum:
+            case Intrinsic::maximum:
+              cmp = IRB.CreateFCmpOGT(lhs, rhs);
+              break;
+            default:
+              continue;
+
+          }
+
+          markAflSkip(cmp);
+          Value *res = IRB.CreateFreeze(cmp);
+          markAflSkip(res);
+
+          if (mmv) {
+
+            uint32_t elements = mmv->getElementCount().getFixedValue();
+            if (!elements) continue;
+            vector_cnt = elements;
+            inst += elements * 2;
+
+            FixedVectorType *GuardPtr1 =
+                FixedVectorType::get(Int32Ty, elements);
+            FixedVectorType *GuardPtr2 =
+                FixedVectorType::get(Int32Ty, elements);
+
+            Value *val1 =
+                applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+            Value *val2 =
+                applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+            Value *x = IRB.CreateInsertElement(GuardPtr1, val1, (uint64_t)0);
+            Value *y = IRB.CreateInsertElement(GuardPtr2, val2, (uint64_t)0);
+
+            for (uint64_t i = 1; i < elements; i++) {
+
+              val1 = applyCtxOffset(IRB,
+                                    ConstantInt::get(Int32Ty, ++afl_global_id));
+              val2 = applyCtxOffset(IRB,
+                                    ConstantInt::get(Int32Ty, ++afl_global_id));
+              x = IRB.CreateInsertElement(x, val1, i);
+              y = IRB.CreateInsertElement(y, val2, i);
+
+            }
+
+            result = IRB.CreateSelect(res, x, y);
+
+          } else {
+
+            if (mmscalable) {
+
+              res = IRB.CreateOrReduce(res);
+              markAflSkip(res);
+
+            }
+
+            Value *val1 =
+                applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+            Value *val2 =
+                applyCtxOffset(IRB, ConstantInt::get(Int32Ty, ++afl_global_id));
+            result = IRB.CreateSelect(res, val1, val2);
+            inst += 2;
+
+          }
+
+          markAflSkip(result);
+
+        }
+
+        if (!result) continue;
+
+        markAflSkip(result);
+        updateBitmapForResult(IRB, result, vector_cnt);
+        decision_cnt++;
+
+      }
+
+    }
+
+    if (!instrument_ctx || call_counter <= 1)
+      if (shouldInstrumentBlock(F, &BB, DT, PDT, Options))
+        BlocksToInstrument.push_back(&BB);
+
+  }
+
+  /* PATH analysis must run BEFORE InjectCoverage so that the guard-only
+     classification sees the source-level CFG, not the post-instrumented
+     CFG where most BBs have an edge-counter store at their head. */
+  if (path_mode) { analyzePathCoverage(F); }
+
   InjectCoverage(F, BlocksToInstrument, IsLeafFunc);
-  InjectCoverageForIndirectCalls(F, IndirCalls);
+  // InjectCoverageForIndirectCalls(F, IndirCalls);
+
+  /*if (debug)
+    fprintf(stderr, "Done instrumentation (%u-%u=%u %u-%u=%u)\n", inst,
+            inst_save, inst - inst_save, afl_global_id, save_global,
+            afl_global_id - save_global);*/
+
+  if (inst_in_this_func && call_counter > 1) {
+
+    if (inst_in_this_func != afl_global_id - save_global) {
+
+      fprintf(
+          stderr,
+          "BUG! inst_in_this_func %u != afl_global_id %u - save_global %u\n",
+          inst_in_this_func, afl_global_id, save_global);
+      exit(-1);
+
+    }
+
+    uint32_t extra_ctx_inst_in_this_func =
+        inst_in_this_func * (call_counter - 1);
+
+    extra_ctx_inst += extra_ctx_inst_in_this_func;
+    afl_global_id += extra_ctx_inst_in_this_func;
+
+  }
+
+  if (path_mode) { instrumentPathCoverage(F, DT, call_counter, PrevCtxLoad); }
 
 }
 
-GlobalVariable *ModuleSanitizerCoverage::CreateFunctionLocalArrayInSection(
+GlobalVariable *ModuleSanitizerCoverageLTO::CreateFunctionLocalArrayInSection(
     size_t NumElements, Function &F, Type *Ty, const char *Section) {
 
   ArrayType *ArrayTy = ArrayType::get(Ty, NumElements);
@@ -1336,19 +2688,12 @@ GlobalVariable *ModuleSanitizerCoverage::CreateFunctionLocalArrayInSection(
       *CurModule, ArrayTy, false, GlobalVariable::PrivateLinkage,
       Constant::getNullValue(ArrayTy), "__sancov_gen_");
 
-#if LLVM_VERSION_MAJOR > 12
   if (TargetTriple.supportsCOMDAT() &&
       (TargetTriple.isOSBinFormatELF() || !F.isInterposable()))
     if (auto Comdat = getOrCreateFunctionComdat(F, TargetTriple))
       Array->setComdat(Comdat);
-#else
-  if (TargetTriple.supportsCOMDAT() && !F.isInterposable())
-    if (auto Comdat =
-            GetOrCreateFunctionComdat(F, TargetTriple, CurModuleUniqueId))
-      Array->setComdat(Comdat);
-#endif
   Array->setSection(getSectionName(Section));
-  Array->setAlignment(Align(DL->getTypeStoreSize(Ty).getFixedSize()));
+  Array->setAlignment(Align(DL->getTypeStoreSize(Ty).getFixedValue()));
   GlobalsToAppendToUsed.push_back(Array);
   GlobalsToAppendToCompilerUsed.push_back(Array);
   MDNode *MD = MDNode::get(F.getContext(), ValueAsMetadata::get(&F));
@@ -1358,68 +2703,24 @@ GlobalVariable *ModuleSanitizerCoverage::CreateFunctionLocalArrayInSection(
 
 }
 
-GlobalVariable *ModuleSanitizerCoverage::CreatePCArray(
-    Function &F, ArrayRef<BasicBlock *> AllBlocks) {
-
-  size_t N = AllBlocks.size();
-  assert(N);
-  SmallVector<Constant *, 32> PCs;
-  IRBuilder<>                 IRB(&*F.getEntryBlock().getFirstInsertionPt());
-  for (size_t i = 0; i < N; i++) {
-
-    if (&F.getEntryBlock() == AllBlocks[i]) {
-
-      PCs.push_back((Constant *)IRB.CreatePointerCast(&F, IntptrPtrTy));
-      PCs.push_back((Constant *)IRB.CreateIntToPtr(
-          ConstantInt::get(IntptrTy, 1), IntptrPtrTy));
-
-    } else {
-
-      PCs.push_back((Constant *)IRB.CreatePointerCast(
-          BlockAddress::get(AllBlocks[i]), IntptrPtrTy));
-      PCs.push_back((Constant *)IRB.CreateIntToPtr(
-          ConstantInt::get(IntptrTy, 0), IntptrPtrTy));
-
-    }
-
-  }
-
-  auto *PCArray = CreateFunctionLocalArrayInSection(N * 2, F, IntptrPtrTy,
-                                                    SanCovPCsSectionName);
-  PCArray->setInitializer(
-      ConstantArray::get(ArrayType::get(IntptrPtrTy, N * 2), PCs));
-  PCArray->setConstant(true);
-
-  return PCArray;
-
-}
-
-void ModuleSanitizerCoverage::CreateFunctionLocalArrays(
+void ModuleSanitizerCoverageLTO::CreateFunctionLocalArrays(
     Function &F, ArrayRef<BasicBlock *> AllBlocks) {
 
   if (Options.TracePCGuard)
     FunctionGuardArray = CreateFunctionLocalArrayInSection(
         AllBlocks.size(), F, Int32Ty, SanCovGuardsSectionName);
-  if (Options.Inline8bitCounters)
-    Function8bitCounterArray = CreateFunctionLocalArrayInSection(
-        AllBlocks.size(), F, Int8Ty, SanCovCountersSectionName);
-  if (Options.InlineBoolFlag)
-    FunctionBoolArray = CreateFunctionLocalArrayInSection(
-        AllBlocks.size(), F, Int1Ty, SanCovBoolFlagSectionName);
-  if (Options.PCTable) FunctionPCsArray = CreatePCArray(F, AllBlocks);
 
 }
 
-bool ModuleSanitizerCoverage::InjectCoverage(Function &             F,
-                                             ArrayRef<BasicBlock *> AllBlocks,
-                                             bool IsLeafFunc) {
+bool ModuleSanitizerCoverageLTO::InjectCoverage(
+    Function &F, ArrayRef<BasicBlock *> AllBlocks, bool IsLeafFunc) {
 
   if (AllBlocks.empty()) return false;
   CreateFunctionLocalArrays(F, AllBlocks);
 
   for (size_t i = 0, N = AllBlocks.size(); i < N; i++) {
 
-    // afl++ START
+    // AFL++ START
     if (BlockList.size()) {
 
       int skip = 0;
@@ -1441,7 +2742,7 @@ bool ModuleSanitizerCoverage::InjectCoverage(Function &             F,
 
     }
 
-    // afl++ END
+    // AFL++ END
 
     InjectCoverageAtBlock(F, *AllBlocks[i], i, IsLeafFunc);
 
@@ -1451,34 +2752,38 @@ bool ModuleSanitizerCoverage::InjectCoverage(Function &             F,
 
 }
 
-// On every indirect call we call a run-time function
-// __sanitizer_cov_indir_call* with two parameters:
-//   - callee address,
-//   - global cache array that contains CacheSize pointers (zero-initialized).
-//     The cache is used to speed up recording the caller-callee pairs.
-// The address of the caller is passed implicitly via caller PC.
-// CacheSize is encoded in the name of the run-time function.
-void ModuleSanitizerCoverage::InjectCoverageForIndirectCalls(
-    Function &F, ArrayRef<Instruction *> IndirCalls) {
+bool ModuleSanitizerCoverageLTO::Fake_InjectCoverage(
+    Function &F, ArrayRef<BasicBlock *> AllBlocks, bool IsLeafFunc) {
 
-  if (IndirCalls.empty()) return;
-  assert(Options.TracePC || Options.TracePCGuard ||
-         Options.Inline8bitCounters || Options.InlineBoolFlag);
-  for (auto I : IndirCalls) {
+  if (AllBlocks.empty()) return false;
 
-    IRBuilder<> IRB(I);
-    CallBase &  CB = cast<CallBase>(*I);
-    Value *     Callee = CB.getCalledOperand();
-    if (isa<InlineAsm>(Callee)) continue;
-    IRB.CreateCall(SanCovTracePCIndir, IRB.CreatePointerCast(Callee, IntptrTy));
+  for (size_t i = 0, N = AllBlocks.size(); i < N; i++) {
+
+    if (BlockList.size()) {
+
+      int skip = 0;
+      for (uint32_t k = 0; k < BlockList.size(); k++) {
+
+        if (AllBlocks[i] == BlockList[k]) { skip = 1; }
+
+      }
+
+      if (skip) continue;
+
+    }
+
+    ++inst;  // InjectCoverageAtBlock()
 
   }
 
+  return true;
+
 }
 
-void ModuleSanitizerCoverage::InjectCoverageAtBlock(Function &F, BasicBlock &BB,
-                                                    size_t Idx,
-                                                    bool   IsLeafFunc) {
+void ModuleSanitizerCoverageLTO::InjectCoverageAtBlock(Function   &F,
+                                                       BasicBlock &BB,
+                                                       size_t      Idx,
+                                                       bool        IsLeafFunc) {
 
   BasicBlock::iterator IP = BB.getFirstInsertionPt();
   bool                 IsEntryBB = &BB == &F.getEntryBlock();
@@ -1496,87 +2801,94 @@ void ModuleSanitizerCoverage::InjectCoverageAtBlock(Function &F, BasicBlock &BB,
   if (Options.TracePC) {
 
     IRB.CreateCall(SanCovTracePC)
-#if LLVM_VERSION_MAJOR < 12
-        ->cannotMerge();  // gets the PC using GET_CALLER_PC.
-#else
         ->setCannotMerge();  // gets the PC using GET_CALLER_PC.
-#endif
 
   }
 
   if (Options.TracePCGuard) {
 
-    // afl++ START
+    // AFL++ START
     ++afl_global_id;
 
-    if (documentFile) {
+    if (dFile.is_open()) {
 
       unsigned long long int moduleID =
           (((unsigned long long int)(rand() & 0xffffffff)) << 32) | getpid();
-      fprintf(documentFile, "ModuleID=%llu Function=%s edgeID=%u\n", moduleID,
-              F.getName().str().c_str(), afl_global_id);
+      dFile << "ModuleID=" << moduleID << " Function=" << F.getName().str()
+            << " edgeID=" << afl_global_id << "\n";
 
     }
 
     /* Set the ID of the inserted basic block */
 
     ConstantInt *CurLoc = ConstantInt::get(Int32Tyi, afl_global_id);
+    Value       *val = CurLoc;
 
-    /* Load SHM pointer */
+    if (CTX_add) {
 
-    Value *MapPtrIdx;
-
-    if (map_addr) {
-
-      MapPtrIdx = IRB.CreateGEP(MapPtrFixed, CurLoc);
-
-    } else {
-
-      LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
-      MapPtr->setMetadata(Mo->getMDKindID("nosanitize"),
-                          MDNode::get(*Ct, None));
-      MapPtrIdx = IRB.CreateGEP(MapPtr, CurLoc);
+      LoadInst *CTX_load = IRB.CreateLoad(IRB.getInt32Ty(), CTX_add);
+      setNoSanitizeMetadata(CTX_load);
+      val = IRB.CreateAdd(CurLoc, CTX_load);
 
     }
+
+    // Apply IJON state-aware coverage if enabled
+    if (ijon_enabled && AFLIJONState) {
+
+      LoadInst *IJONStateVal = IRB.CreateLoad(Int32Tyi, AFLIJONState);
+      setNoSanitizeMetadata(IJONStateVal);
+      // Apply IJON formula: state XOR coverage_index
+      Value *XorResult = IRB.CreateXor(IJONStateVal, val);
+      // Ensure result stays within map bounds to prevent buffer overruns
+      LoadInst *CovMapSize = IRB.CreateLoad(Int32Tyi, AFLCovMapSize);
+      setNoSanitizeMetadata(CovMapSize);
+      val = IRB.CreateURem(XorResult, CovMapSize);
+
+    }
+
+    /* GEP into the SHM map (pointer loaded once in preamble) */
+
+    Value *EffMapPtr = HoistedMapPtr;
+    if (!EffMapPtr) {
+
+      auto *L = IRB.CreateLoad(PtrTy, AFLMapPtr);
+      setNoSanitizeMetadata(L);
+      EffMapPtr = L;
+
+    }
+
+    Value *MapPtrIdx = IRB.CreateGEP(Int8Ty, EffMapPtr, val);
 
     /* Update bitmap */
     if (use_threadsafe_counters) {                                /* Atomic */
 
       IRB.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp::Add, MapPtrIdx, One,
-#if LLVM_VERSION_MAJOR >= 13
-                          llvm::MaybeAlign(1),
-#endif
-                          llvm::AtomicOrdering::Monotonic);
+                          llvm::MaybeAlign(1), llvm::AtomicOrdering::Monotonic);
 
     } else {
 
-      LoadInst *Counter = IRB.CreateLoad(MapPtrIdx);
-      Counter->setMetadata(Mo->getMDKindID("nosanitize"),
-                           MDNode::get(*Ct, None));
+      LoadInst *Counter = IRB.CreateLoad(IRB.getInt8Ty(), MapPtrIdx);
+      setNoSanitizeMetadata(Counter);
 
       Value *Incr = IRB.CreateAdd(Counter, One);
 
       if (skip_nozero == NULL) {
 
-        auto cf = IRB.CreateICmpEQ(Incr, Zero);
-        auto carry = IRB.CreateZExt(cf, Int8Tyi);
-        Incr = IRB.CreateAdd(Incr, carry);
+        Incr = IRB.CreateBinaryIntrinsic(Intrinsic::umax, Incr, One);
 
       }
 
-      IRB.CreateStore(Incr, MapPtrIdx)
-          ->setMetadata(Mo->getMDKindID("nosanitize"), MDNode::get(*Ct, None));
+      auto nosan = IRB.CreateStore(Incr, MapPtrIdx);
+      setNoSanitizeMetadata(nosan);
 
     }
 
     // done :)
 
-    inst++;
-    // afl++ END
+    ++inst;
+    // AFL++ END
 
     /*
-    XXXXXXXXXXXXXXXXXXX
-
         auto GuardPtr = IRB.CreateIntToPtr(
             IRB.CreateAdd(IRB.CreatePointerCast(FunctionGuardArray, IntptrTy),
                           ConstantInt::get(IntptrTy, Idx * 4)),
@@ -1587,44 +2899,204 @@ void ModuleSanitizerCoverage::InjectCoverageAtBlock(Function &F, BasicBlock &BB,
 
   }
 
-  if (Options.Inline8bitCounters) {
+}
 
-    auto CounterPtr = IRB.CreateGEP(
-        Function8bitCounterArray->getValueType(), Function8bitCounterArray,
-        {ConstantInt::get(IntptrTy, 0), ConstantInt::get(IntptrTy, Idx)});
-    auto Load = IRB.CreateLoad(Int8Ty, CounterPtr);
-    auto Inc = IRB.CreateAdd(Load, ConstantInt::get(Int8Ty, 1));
-    auto Store = IRB.CreateStore(Inc, CounterPtr);
-    SetNoSanitizeMetadata(Load);
-    SetNoSanitizeMetadata(Store);
+/* Ball-Larus path coverage — analysis phase.
+
+   Runs BEFORE InjectCoverage(F) so isGuardOnlyBB() sees the pristine
+   source-level CFG (edge-coverage stores added later would make most
+   BBs ineligible for the PATH=1 collapse).  Persists the analysis
+   results in per-function members consumed by instrumentPathCoverage(). */
+bool ModuleSanitizerCoverageLTO::analyzePathCoverage(Function &F) {
+
+  pathNumPaths.clear();
+  pathEdgeVal.clear();
+  pathExits.clear();
+  pathNumEntry = 0;
+
+  if (!path_mode || F.empty()) return false;
+  if (F.hasFnAttribute(llvm::Attribute::NoSanitizeCoverage)) return false;
+#if LLVM_VERSION_MAJOR >= 19
+  if (F.hasFnAttribute(llvm::Attribute::DisableSanitizerInstrumentation))
+    return false;
+#endif
+  if (!isInInstrumentList(&F, FMNAME)) return false;
+
+  afl::PathAnalysis       PA(path_mode_level, path_max_paths);
+  afl::PathAnalysisResult R = PA.analyze(F);
+
+  if (R.overCap) {
+
+    WARNF(
+        "Function %s has too many paths (>%llu) even after simplification; "
+        "skipping PATH instrumentation in this function.",
+        F.getName().str().c_str(), (unsigned long long)path_max_paths);
+    ++path_skipped_funcs;
+    return false;
 
   }
 
-  if (Options.InlineBoolFlag) {
+  if (R.simplified) {
 
-    auto FlagPtr = IRB.CreateGEP(
-        FunctionBoolArray->getValueType(), FunctionBoolArray,
-        {ConstantInt::get(IntptrTy, 0), ConstantInt::get(IntptrTy, Idx)});
-    auto Load = IRB.CreateLoad(Int1Ty, FlagPtr);
-    auto ThenTerm =
-        SplitBlockAndInsertIfThen(IRB.CreateIsNull(Load), &*IP, false);
-    IRBuilder<> ThenIRB(ThenTerm);
-    auto Store = ThenIRB.CreateStore(ConstantInt::getTrue(Int1Ty), FlagPtr);
-    SetNoSanitizeMetadata(Load);
-    SetNoSanitizeMetadata(Store);
+    WARNF(
+        "Function %s simplified for PATH (multi-way branches collapsed): "
+        "%llu paths.",
+        F.getName().str().c_str(), (unsigned long long)R.numPaths);
 
   }
+
+  if (R.numPaths == 0) return false;
+
+  pathExits = std::move(R.exits);
+  pathNumPaths = std::move(R.numPathsAtBB);
+  pathEdgeVal = std::move(R.edgeValues);
+  pathNumEntry = R.numPaths;
+  return true;
 
 }
 
-std::string ModuleSanitizerCoverage::getSectionName(
+/* Ball-Larus path coverage — emission phase.
+   Consumes the per-function state stashed by analyzePathCoverage and
+   emits IR after InjectCoverage has finished.
+   - Reserves afl_global_id range (NumPaths or NumPaths * call_counter
+     under CTX composition).
+   - Allocates a per-function i32 path register.
+   - Inserts `path_reg += edge_val` on each forward edge with edge_val != 0.
+   - At every exit point writes the path id into the reserved bitmap range.
+     CTX composition adds cid * NumPaths to the index. */
+uint64_t ModuleSanitizerCoverageLTO::instrumentPathCoverage(
+    Function &F, const DominatorTree *DT, uint32_t call_counter,
+    LoadInst *PrevCtxLoad) {
+
+  (void)DT;
+  if (!path_mode) return 0;
+  if (pathNumEntry == 0) return 0;  // analyzePathCoverage said skip
+
+  LLVMContext &Ctx = F.getContext();
+  IntegerType *Int32 = Type::getInt32Ty(Ctx);
+  MDNode      *NoSan = MDNode::get(Ctx, MDString::get(Ctx, "nosanitize"));
+
+  uint64_t    numEntry = pathNumEntry;
+  const auto &Exits = pathExits;
+  const auto &NumPaths = pathNumPaths;
+  const auto &EdgeVal = pathEdgeVal;
+
+  /* 5. Reserve afl_global_id range.  When CTX expanded this function,
+     reserve NumPaths * call_counter so each (call_id, path) tuple has
+     its own slot.  Otherwise reserve NumPaths.                         */
+  bool     ctx_active = (call_counter > 1) && PrevCtxLoad != nullptr;
+  uint64_t reservation =
+      ctx_active ? numEntry * (uint64_t)call_counter : numEntry;
+  /* The IR uses a signed i32 for the path index. The GEP into the
+     bitmap sign-extends i32 → pointer-width, so any index >= 2^31
+     becomes a large negative byte offset and writes OOB. Cap at
+     INT32_MAX rather than UINT32_MAX. */
+  if (reservation > (uint64_t)INT32_MAX ||
+      (uint64_t)afl_global_id + reservation > (uint64_t)INT32_MAX) {
+
+    WARNF(
+        "Function %s would push afl_global_id past 2^31 "
+        "(current=%u, reservation=%llu); skipping PATH instrumentation.",
+        F.getName().str().c_str(), afl_global_id,
+        (unsigned long long)reservation);
+    ++path_skipped_funcs;
+    return 0;
+
+  }
+
+  uint32_t path_base = afl_global_id;
+  afl_global_id += (uint32_t)reservation;
+  extra_path_inst += reservation;
+
+  if (debug) {
+
+    fprintf(stderr,
+            "DEBUG: PATH function=%s paths=%llu reservation=%llu base=%u%s\n",
+            F.getName().str().c_str(), (unsigned long long)numEntry,
+            (unsigned long long)reservation, path_base,
+            ctx_active ? " (CTX-composed)" : "");
+
+  }
+
+  /* 6. IR insertion: alloca path_reg + edge increments via the shared
+     emitter; exit-point writes follow below (LTO-specific). */
+  AllocaInst *path_reg = afl::emitPathCoverageEdges(
+      F, EdgeVal,
+      /*setMD=*/[&](Instruction *I) { I->setMetadata("nosanitize", NoSan); });
+
+  /* 6c. Path-ID writes at every exit point in DAG-reachable BBs.
+     E.first is the BB; E.second is the instruction to insert before. */
+  for (auto &E : Exits) {
+
+    if (!NumPaths.count(E.first)) continue;  // unreachable in DAG
+    IRBuilder<> IRB(E.second);
+
+    LoadInst *p = IRB.CreateLoad(Int32, path_reg);
+    p->setMetadata("nosanitize", NoSan);
+
+    Value *idx = IRB.CreateAdd(p, ConstantInt::get(Int32, path_base));
+
+    if (ctx_active) {
+
+      LoadInst *cid = IRB.CreateLoad(Int32, AFLContext);
+      cid->setMetadata("nosanitize", NoSan);
+      Value *ctxOff =
+          IRB.CreateMul(cid, ConstantInt::get(Int32, (uint32_t)numEntry));
+      idx = IRB.CreateAdd(idx, ctxOff);
+
+    }
+
+    /* Zero-extend to i64 before the GEP so the byte offset is unsigned —
+       GEP otherwise sign-extends an i32 index and a value >= 2^31 would
+       become a large negative offset. */
+    Value *idx64 = IRB.CreateZExt(idx, IntegerType::getInt64Ty(Ctx));
+
+    /* Bitmap update (mirrors InjectCoverageAtBlock, minus the CTX_add
+       handling — the path index already includes the per-call offset). */
+    Value *EffMapPtr = HoistedMapPtr;
+    if (!EffMapPtr) {
+
+      auto *L = IRB.CreateLoad(PtrTy, AFLMapPtr);
+      L->setMetadata("nosanitize", NoSan);
+      EffMapPtr = L;
+
+    }
+
+    Value *MapPtrIdx = IRB.CreateGEP(Int8Ty, EffMapPtr, idx64);
+
+    if (use_threadsafe_counters) {
+
+      IRB.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp::Add, MapPtrIdx, One,
+                          llvm::MaybeAlign(1), llvm::AtomicOrdering::Monotonic);
+
+    } else {
+
+      LoadInst *Counter =
+          IRB.CreateLoad(IntegerType::getInt8Ty(Ctx), MapPtrIdx);
+      Counter->setMetadata("nosanitize", NoSan);
+      Value *Incr = IRB.CreateAdd(Counter, One);
+      if (skip_nozero == NULL) {
+
+        Incr = IRB.CreateBinaryIntrinsic(Intrinsic::umax, Incr, One);
+
+      }
+
+      StoreInst *st = IRB.CreateStore(Incr, MapPtrIdx);
+      st->setMetadata("nosanitize", NoSan);
+
+    }
+
+  }
+
+  return reservation;
+
+}
+
+std::string ModuleSanitizerCoverageLTO::getSectionName(
     const std::string &Section) const {
 
   if (TargetTriple.isOSBinFormatCOFF()) {
 
-    if (Section == SanCovCountersSectionName) return ".SCOV$CM";
-    if (Section == SanCovBoolFlagSectionName) return ".SCOV$BM";
-    if (Section == SanCovPCsSectionName) return ".SCOVP$M";
     return ".SCOV$GM";  // For SanCovGuardsSectionName.
 
   }
@@ -1634,52 +3106,22 @@ std::string ModuleSanitizerCoverage::getSectionName(
 
 }
 
-/*
-std::string ModuleSanitizerCoverage::getSectionStart(
-    const std::string &Section) const {
+char ModuleSanitizerCoverageLTOLegacyPass::ID = 0;
 
-  if (TargetTriple.isOSBinFormatMachO())
-    return "\1section$start$__DATA$__" + Section;
-  return "__start___" + Section;
-
-}
-
-std::string ModuleSanitizerCoverage::getSectionEnd(
-    const std::string &Section) const {
-
-  if (TargetTriple.isOSBinFormatMachO())
-    return "\1section$end$__DATA$__" + Section;
-  return "__stop___" + Section;
-
-}
-
-*/
-
-char ModuleSanitizerCoverageLegacyPass::ID = 0;
-
-INITIALIZE_PASS_BEGIN(ModuleSanitizerCoverageLegacyPass, "sancov",
+INITIALIZE_PASS_BEGIN(ModuleSanitizerCoverageLTOLegacyPass, "sancov-lto",
                       "Pass for instrumenting coverage on functions", false,
                       false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(PostDominatorTreeWrapperPass)
-INITIALIZE_PASS_END(ModuleSanitizerCoverageLegacyPass, "sancov",
+INITIALIZE_PASS_END(ModuleSanitizerCoverageLTOLegacyPass, "sancov-lto",
                     "Pass for instrumenting coverage on functions", false,
                     false)
 
-ModulePass *llvm::createModuleSanitizerCoverageLegacyPassPass(
-    const SanitizerCoverageOptions &Options,
-    const std::vector<std::string> &AllowlistFiles,
-    const std::vector<std::string> &BlocklistFiles) {
-
-  return new ModuleSanitizerCoverageLegacyPass(Options);
-  //, AllowlistFiles, BlocklistFiles);
-
-}
-
+#if LLVM_VERSION_MAJOR < 16
 static void registerLTOPass(const PassManagerBuilder &,
                             legacy::PassManagerBase &PM) {
 
-  auto p = new ModuleSanitizerCoverageLegacyPass();
+  auto p = new ModuleSanitizerCoverageLTOLegacyPass();
   PM.add(p);
 
 }
@@ -1690,7 +3132,6 @@ static RegisterStandardPasses RegisterCompTransPass(
 static RegisterStandardPasses RegisterCompTransPass0(
     PassManagerBuilder::EP_EnabledOnOptLevel0, registerLTOPass);
 
-#if LLVM_VERSION_MAJOR >= 11
 static RegisterStandardPasses RegisterCompTransPassLTO(
     PassManagerBuilder::EP_FullLinkTimeOptimizationLast, registerLTOPass);
 #endif

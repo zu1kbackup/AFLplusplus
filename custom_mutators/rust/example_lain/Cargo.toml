@@ -2,13 +2,13 @@
 name = "example_lain"
 version = "0.1.0"
 authors = ["Julius Hohnerlein <julihoh@users.noreply.github.com>"]
-edition = "2018"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 custom_mutator = { path = "../custom_mutator" }
-lain="0.5"
+lain = { git = "https://github.com/AFLplusplus/lain.git" }
 
 [[example]]
 name = "example_lain"

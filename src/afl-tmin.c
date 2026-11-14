@@ -7,18 +7,20 @@
    Forkserver design by Jann Horn <jannhorn@googlemail.com>
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
+                        Heiko Eissfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com> and
                         Dominik Maier <mail@dmnk.co>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2026 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
 
-     http://www.apache.org/licenses/LICENSE-2.0
+     https://www.apache.org/licenses/LICENSE-2.0
+
+   SPDX-License-Identifier: Apache-2.0
 
    A simple test case minimizer that takes an input file and tries to remove
    as much data as possible while keeping the binary in a crashing state
@@ -37,6 +39,8 @@
 #include "forkserver.h"
 #include "sharedmem.h"
 #include "common.h"
+#include "afl-fuzz.h"
+#include "list.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -48,6 +52,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <libgen.h>
 
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -57,8 +62,30 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/resource.h>
+#ifdef USE_PYTHON
+  #include <Python.h>
+#endif
 
-static u8 *mask_bitmap;                /* Mask for trace bits (-B)          */
+extern void destroy_custom_mutators(afl_state_t *);
+void        list_init(list_t *list) {
+
+  if (list) {
+
+    list->element_prealloc_count = 0;
+    memset(list->element_prealloc_buf, 0, sizeof(list->element_prealloc_buf));
+
+  }
+
+}
+
+void                   setup_custom_mutators(afl_state_t *);
+struct custom_mutator *load_custom_mutator(afl_state_t *, const char *);
+#ifdef USE_PYTHON
+struct custom_mutator *load_custom_mutator_py(afl_state_t *, char *);
+#endif
+
+static afl_state_t *afl;               /* State for custom mutators         */
+static u8          *mask_bitmap;       /* Mask for trace bits (-B)          */
 
 static u8 *in_file,                    /* Minimizer input test case         */
     *out_file, *output_file;           /* Minimizer output file             */
@@ -82,11 +109,13 @@ static u8 crash_mode,                  /* Crash-centric mode?               */
     remove_shm = 1,                    /* remove shmem on exit?             */
     debug;                             /* debug mode                        */
 
+static u32 del_len_limit = 1;          /* Minimum block deletion length     */
+
 static volatile u8 stop_soon;          /* Ctrl-C pressed?                   */
 
 static afl_forkserver_t *fsrv;
 static sharedmem_t       shm;
-static sharedmem_t *     shm_fuzz;
+static sharedmem_t      *shm_fuzz;
 
 /*
  * forkserver section
@@ -95,33 +124,34 @@ static sharedmem_t *     shm_fuzz;
 /* Classify tuple counts. This is a slow & naive version, but good enough here.
  */
 
-#define TIMES4(x) x, x, x, x
-#define TIMES8(x) TIMES4(x), TIMES4(x)
-#define TIMES16(x) TIMES8(x), TIMES8(x)
-#define TIMES32(x) TIMES16(x), TIMES16(x)
-#define TIMES64(x) TIMES32(x), TIMES32(x)
 static const u8 count_class_lookup[256] = {
 
     [0] = 0,
     [1] = 1,
     [2] = 2,
     [3] = 4,
-    [4] = TIMES4(8),
-    [8] = TIMES8(16),
-    [16] = TIMES16(32),
-    [32] = TIMES32(64),
-    [128] = TIMES64(128)
+    [4 ... 7] = 8,
+    [8 ... 15] = 16,
+    [16 ... 31] = 32,
+    [32 ... 127] = 64,
+    [128 ... 255] = 128
 
 };
 
-#undef TIMES64
-#undef TIMES32
-#undef TIMES16
-#undef TIMES8
-#undef TIMES4
+static void kill_child(int signal) {
+
+  (void)signal;
+  if (fsrv->child_pid > 0) {
+
+    kill(fsrv->child_pid, fsrv->child_kill_signal);
+    fsrv->child_pid = -1;
+
+  }
+
+}
 
 static sharedmem_t *deinit_shmem(afl_forkserver_t *fsrv,
-                                 sharedmem_t *     shm_fuzz) {
+                                 sharedmem_t      *shm_fuzz) {
 
   afl_shm_deinit(shm_fuzz);
   fsrv->support_shmem_fuzz = 0;
@@ -131,6 +161,69 @@ static sharedmem_t *deinit_shmem(afl_forkserver_t *fsrv,
   return NULL;
 
 }
+
+/* dummy functions */
+u32 write_to_testcase(afl_state_t *afl, void **mem, u32 a, u32 b) {
+
+  (void)afl;
+  (void)mem;
+  return a + b;
+
+}
+
+void show_stats(afl_state_t *afl) {
+
+  (void)afl;
+
+}
+
+void update_bitmap_score(afl_state_t *afl, struct queue_entry *q,
+                         bool add_to_queue) {
+
+  (void)afl;
+  (void)q;
+  (void)add_to_queue;
+
+}
+
+fsrv_run_result_t fuzz_run_target(afl_state_t *afl, afl_forkserver_t *fsrv,
+                                  u32 i) {
+
+  (void)afl;
+  (void)fsrv;
+  (void)i;
+  return 0;
+
+}
+
+u8 save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
+
+  (void)afl;
+  (void)mem;
+  (void)len;
+  (void)fault;
+  return 0;
+
+}
+
+void update_trim_time(afl_state_t *afl, u64 *time) {
+
+  (void)afl;
+  (void)time;
+
+}
+
+#ifndef USE_PYTHON
+struct custom_mutator *load_custom_mutator_py(afl_state_t *afl, char *module) {
+
+  (void)afl;
+  (void)module;
+  FATAL("Python support not available in this build");
+  return NULL;
+
+}
+
+#endif
 
 /* Apply mask to classified bitmap (if set). */
 
@@ -150,7 +243,7 @@ static void apply_mask(u32 *mem, u32 *mask) {
 
 }
 
-static void classify_counts(afl_forkserver_t *fsrv) {
+void classify_counts(afl_forkserver_t *fsrv) {
 
   u8 *mem = fsrv->trace_bits;
   u32 i = map_size;
@@ -206,6 +299,13 @@ static void at_exit_handler(void) {
   afl_fsrv_killall();
   if (remove_out_file) unlink(out_file);
 
+  if (afl) {
+
+    destroy_custom_mutators(afl);
+    ck_free(afl);
+
+  }
+
 }
 
 /* Read initial file. */
@@ -221,7 +321,7 @@ static void read_initial_file(void) {
 
   if (st.st_size >= TMIN_MAX_FILE) {
 
-    FATAL("Input file is too large (%u MB max)", TMIN_MAX_FILE / 1024 / 1024);
+    FATAL("Input file is too large (%ld MB max)", TMIN_MAX_FILE / 1024 / 1024);
 
   }
 
@@ -256,14 +356,72 @@ static s32 write_to_file(u8 *path, u8 *mem, u32 len) {
 
 }
 
+/* Helper function to handle custom mutators for testcase writing */
+static void pre_afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *mem,
+                                           u32 len) {
+
+  static u8 buf[MAX_FILE];
+  u32       sent = 0;
+
+  if (afl && afl->custom_mutators_count) {
+
+    ssize_t new_size = len;
+    u8     *new_mem = mem;
+    u8     *new_buf = NULL;
+
+    LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
+
+      if (el->afl_custom_post_process) {
+
+        new_size =
+            el->afl_custom_post_process(el->data, new_mem, new_size, &new_buf);
+
+        if (!new_buf || new_size <= 0) {
+
+          return;
+
+        } else {
+
+          new_mem = new_buf;
+          len = new_size;
+
+        }
+
+      }
+
+    });
+
+    if (new_mem != mem && new_mem != NULL) {
+
+      mem = buf;
+      memcpy(mem, new_mem, new_size);
+
+    }
+
+    LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
+
+      if (el->afl_custom_fuzz_send) {
+
+        el->afl_custom_fuzz_send(el->data, mem, len);
+        sent = 1;
+
+      }
+
+    });
+
+  }
+
+  if (!sent) { afl_fsrv_write_to_testcase(fsrv, mem, len); }
+
+}
+
 /* Execute target application. Returns 0 if the changes are a dud, or
    1 if they should be kept. */
 
 static u8 tmin_run_target(afl_forkserver_t *fsrv, u8 *mem, u32 len,
                           u8 first_run) {
 
-  afl_fsrv_write_to_testcase(fsrv, mem, len);
-
+  pre_afl_fsrv_write_to_testcase(fsrv, mem, len);
   fsrv_run_result_t ret =
       afl_fsrv_run_target(fsrv, fsrv->exec_tmout, &stop_soon);
 
@@ -354,13 +512,156 @@ static u8 tmin_run_target(afl_forkserver_t *fsrv, u8 *mem, u32 len,
 static void minimize(afl_forkserver_t *fsrv) {
 
   static u32 alpha_map[256];
-
-  u8 *tmp_buf = ck_alloc_nozero(in_len);
-  u32 orig_len = in_len, stage_o_len;
-
-  u32 del_len, set_len, del_pos, set_pos, i, alpha_size, cur_pass = 0;
+  u8        *tmp_buf = ck_alloc_nozero(in_len);
+  u32        orig_len = in_len, stage_o_len;
+  u32        del_len, set_len, del_pos, set_pos, i, alpha_size, cur_pass = 0;
   u32 syms_removed, alpha_del0 = 0, alpha_del1, alpha_del2, alpha_d_total = 0;
   u8  changed_any, prev_del;
+
+#ifdef USE_PYTHON
+  // Try to load python module
+  char *py_module = getenv("AFL_PYTHON_MODULE");
+  if (py_module) {
+
+    // We cannot use Python custom mutators in tmin
+    if (debug) WARNF("Python custom mutator support not available in afl-tmin");
+
+  }
+
+#endif
+
+  // Custom mutator trimming
+  bool custom_trimmed = false;
+  if (afl && afl->custom_mutators_count) {
+
+    LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
+
+      if (el->afl_custom_init_trim && el->afl_custom_trim &&
+          el->afl_custom_post_trim) {
+
+        ACTF("Performing custom trim with %s...", el->name);
+        custom_trimmed = true;
+
+        // Initialize the trimmer
+        s32 max_steps = el->afl_custom_init_trim(el->data, in_data, in_len);
+
+        if (max_steps < 0) {
+
+          WARNF("Custom trimmer %s returned %d, skipping", el->name, max_steps);
+          continue;
+
+        }
+
+        if (afl->debug) {
+
+          DEBUGF("[Custom Trimming] START: Max %u iterations, %u bytes\n",
+                 max_steps, in_len);
+
+        }
+
+        u32 trimmed_successfully = 0;
+
+        // Trim loop
+        s32 cur_step = 0;
+        while (cur_step < max_steps) {
+
+          u8    *trimmed_buf = NULL;
+          size_t trimmed_size;
+
+          u8 *retbuf = NULL;
+          trimmed_size = el->afl_custom_trim(el->data, &retbuf);
+
+          /* Do not exit the fuzzer, even if the trimmed data returned by the
+             custom mutator is larger than the original data. For some use
+             cases, like the grammar mutator, the definition of "size" may have
+             different meanings. For example, the trimming function in a grammar
+             mutator aims at reducing the objects in a grammar structure, but
+             does not guarantee to generate a smaller binary buffer.
+
+             Thus, we allow the custom mutator to generate the trimmed data that
+             is larger than the original data. */
+          if (trimmed_size >= in_len && afl->debug) {
+
+            WARNF(
+                "Trimmed data returned by custom mutator is larger than "
+                "original data");
+
+          }
+
+          /* Do not run the empty test case on the target. To keep the custom
+             trimming function running, we simply treat the empty test case as
+             an unsuccessful trimming and skip it, instead of aborting the
+             trimming. */
+          if (trimmed_size == 0) {
+
+            cur_step = el->afl_custom_post_trim(el->data, 0);
+            continue;
+
+          }
+
+          trimmed_buf = retbuf;
+
+          // Test if the trimmed case still works
+          if (!tmin_run_target(fsrv, trimmed_buf, trimmed_size, 0)) {
+
+            cur_step = el->afl_custom_post_trim(el->data, 0);
+
+            if (afl->debug) {
+
+              DEBUGF("[Custom Trimming] FAILURE: %u/%u iterations\n", cur_step,
+                     max_steps);
+
+            }
+
+          } else {
+
+            // Accept the reduction
+            u8 *old_in_data = in_data;
+            u8 *trimmed_copy = ck_alloc_nozero(trimmed_size);
+            memcpy(trimmed_copy, trimmed_buf, trimmed_size);
+            in_data = trimmed_copy;
+            in_len = trimmed_size;
+
+            trimmed_successfully = 1;
+            cur_step = el->afl_custom_post_trim(el->data, 1);
+
+            if (afl->debug) {
+
+              DEBUGF(
+                  "[Custom trim] SUCCESS: %u/%u iterations "
+                  "(now at %u bytes)\n",
+                  cur_step, max_steps, in_len);
+
+            }
+
+            if (old_in_data) { ck_free(old_in_data); }
+
+          }
+
+        }
+
+        OKF("[Custom Trimming] DONE: %u bytes -> %u bytes", orig_len, in_len);
+
+        if (trimmed_successfully) {
+
+          if (tmp_buf) { ck_free(tmp_buf); }
+          return;  // Skip standard minimization if successful
+
+        }
+
+      }
+
+    });
+
+  }
+
+  // Skip built-in minimization if in_len is too small
+  if (in_len <= 1 || custom_trimmed) {
+
+    if (tmp_buf) { ck_free(tmp_buf); }
+    return;
+
+  }
 
   /***********************
    * BLOCK NORMALIZATION *
@@ -480,7 +781,7 @@ next_del_blksize:
 
   }
 
-  if (del_len > 1 && in_len >= 1) {
+  if (del_len > del_len_limit && in_len >= 1) {
 
     del_len /= 2;
     goto next_del_blksize;
@@ -642,21 +943,20 @@ static void handle_stop_sig(int sig) {
 
 static void set_up_environment(afl_forkserver_t *fsrv, char **argv) {
 
-  u8 *  x;
-  char *afl_preload;
-  char *frida_afl_preload = NULL;
+  u8 *x;
 
   fsrv->dev_null_fd = open("/dev/null", O_RDWR);
   if (fsrv->dev_null_fd < 0) { PFATAL("Unable to open /dev/null"); }
 
   if (!out_file) {
 
-    u8 *use_dir = ".";
+    u8 *use_dir = get_afl_env("TMPDIR");
 
-    if (access(use_dir, R_OK | W_OK | X_OK)) {
+    if (!use_dir) {
 
-      use_dir = get_afl_env("TMPDIR");
-      if (!use_dir) { use_dir = "/tmp"; }
+      use_dir = ".";
+
+      if (access(use_dir, R_OK | W_OK | X_OK)) { use_dir = "/tmp"; }
 
     }
 
@@ -674,27 +974,6 @@ static void set_up_environment(afl_forkserver_t *fsrv, char **argv) {
 
   /* Set sane defaults... */
 
-  x = get_afl_env("ASAN_OPTIONS");
-
-  if (x) {
-
-    if (!strstr(x, "abort_on_error=1")) {
-
-      FATAL("Custom ASAN_OPTIONS set without abort_on_error=1 - please fix!");
-
-    }
-
-#ifndef ASAN_BUILD
-    if (!getenv("AFL_DEBUG") && !strstr(x, "symbolize=0")) {
-
-      FATAL("Custom ASAN_OPTIONS set without symbolize=0 - please fix!");
-
-    }
-
-#endif
-
-  }
-
   x = get_afl_env("MSAN_OPTIONS");
 
   if (x) {
@@ -706,123 +985,25 @@ static void set_up_environment(afl_forkserver_t *fsrv, char **argv) {
 
     }
 
-    if (!strstr(x, "symbolize=0")) {
-
-      FATAL("Custom MSAN_OPTIONS set without symbolize=0 - please fix!");
-
-    }
-
   }
 
-  x = get_afl_env("LSAN_OPTIONS");
-
-  if (x) {
-
-    if (!strstr(x, "symbolize=0")) {
-
-      FATAL("Custom LSAN_OPTIONS set without symbolize=0 - please fix!");
-
-    }
-
-  }
-
-  setenv("ASAN_OPTIONS",
-         "abort_on_error=1:"
-         "detect_leaks=0:"
-         "allocator_may_return_null=1:"
-         "symbolize=0:"
-         "detect_odr_violation=0:"
-         "handle_segv=0:"
-         "handle_sigbus=0:"
-         "handle_abort=0:"
-         "handle_sigfpe=0:"
-         "handle_sigill=0",
-         0);
-
-  setenv("UBSAN_OPTIONS",
-         "halt_on_error=1:"
-         "abort_on_error=1:"
-         "malloc_context_size=0:"
-         "allocator_may_return_null=1:"
-         "symbolize=0:"
-         "handle_segv=0:"
-         "handle_sigbus=0:"
-         "handle_abort=0:"
-         "handle_sigfpe=0:"
-         "handle_sigill=0",
-         0);
-
-  setenv("MSAN_OPTIONS", "exit_code=" STRINGIFY(MSAN_ERROR) ":"
-                         "abort_on_error=1:"
-                         "msan_track_origins=0"
-                         "allocator_may_return_null=1:"
-                         "symbolize=0:"
-                         "handle_segv=0:"
-                         "handle_sigbus=0:"
-                         "handle_abort=0:"
-                         "handle_sigfpe=0:"
-                         "handle_sigill=0", 0);
-
-  setenv("LSAN_OPTIONS",
-         "exitcode=" STRINGIFY(LSAN_ERROR) ":"
-         "fast_unwind_on_malloc=0:"
-         "symbolize=0:"
-         "print_suppressions=0",
-         0);
-
-  if (get_afl_env("AFL_PRELOAD")) {
-
-    if (fsrv->qemu_mode) {
-
-      /* afl-qemu-trace takes care of converting AFL_PRELOAD. */
-
-    } else if (fsrv->frida_mode) {
-
-      afl_preload = getenv("AFL_PRELOAD");
-      u8 *frida_binary = find_afl_binary(argv[0], "afl-frida-trace.so");
-      if (afl_preload) {
-
-        frida_afl_preload = alloc_printf("%s:%s", afl_preload, frida_binary);
-
-      } else {
-
-        frida_afl_preload = alloc_printf("%s", frida_binary);
-
-      }
-
-      ck_free(frida_binary);
-
-      setenv("LD_PRELOAD", frida_afl_preload, 1);
-      setenv("DYLD_INSERT_LIBRARIES", frida_afl_preload, 1);
-
-    } else {
-
-      setenv("LD_PRELOAD", getenv("AFL_PRELOAD"), 1);
-      setenv("DYLD_INSERT_LIBRARIES", getenv("AFL_PRELOAD"), 1);
-
-    }
-
-  } else if (fsrv->frida_mode) {
-
-    u8 *frida_binary = find_afl_binary(argv[0], "afl-frida-trace.so");
-    setenv("LD_PRELOAD", frida_binary, 1);
-    setenv("DYLD_INSERT_LIBRARIES", frida_binary, 1);
-    ck_free(frida_binary);
-
-  }
-
-  if (frida_afl_preload) { ck_free(frida_afl_preload); }
+  set_sanitizer_defaults();
+  afl_fsrv_setup_preload(fsrv, argv[0]);
 
 }
 
 /* Setup signal handlers, duh. */
 
-static void setup_signal_handlers(void) {
+void setup_signal_handlers(void) {
 
   struct sigaction sa;
 
   sa.sa_handler = NULL;
+#ifdef SA_RESTART
   sa.sa_flags = SA_RESTART;
+#else
+  sa.sa_flags = 0;
+#endif
   sa.sa_sigaction = NULL;
 
   sigemptyset(&sa.sa_mask);
@@ -853,29 +1034,43 @@ static void usage(u8 *argv0) {
       "  -f file       - input file read by the tested program (stdin)\n"
       "  -t msec       - timeout for each run (%u ms)\n"
       "  -m megs       - memory limit for child process (%u MB)\n"
+#if defined(__linux__) && defined(__aarch64__)
+      "  -A            - use binary-only instrumentation (ARM CoreSight mode)\n"
+#endif
       "  -O            - use binary-only instrumentation (FRIDA mode)\n"
+#if defined(__linux__)
       "  -Q            - use binary-only instrumentation (QEMU mode)\n"
       "  -U            - use unicorn-based instrumentation (Unicorn mode)\n"
       "  -W            - use qemu-based instrumentation with Wine (Wine "
       "mode)\n"
       "                  (Not necessary, here for consistency with other afl-* "
-      "tools)\n\n"
+      "tools)\n"
+      "  -X            - use Nyx mode\n"
+      "  -K dir        - use python script to interact with GUI (GUI mode)\n"
+#endif
+      "\n"
 
       "Minimization settings:\n"
 
       "  -e            - solve for edge coverage only, ignore hit counts\n"
-      "  -x            - treat non-zero exit codes as crashes\n\n"
-      "  -H            - minimize a hang (hang mode)\n"
+      "  -l bytes      - set minimum block deletion length to speed up minimization\n"
+      "  -x            - treat non-zero exit codes as crashes\n"
+      "  -H            - minimize a hang (hang mode)\n\n"
 
       "For additional tips, please consult %s/README.md.\n\n"
 
       "Environment variables used:\n"
       "AFL_CRASH_EXITCODE: optional child exit code to be interpreted as crash\n"
-      "AFL_FORKSRV_INIT_TMOUT: time spent waiting for forkserver during startup (in milliseconds)\n"
-      "AFL_KILL_SIGNAL: Signal ID delivered to child processes on timeout, etc. (default: SIGKILL)\n"
+      "AFL_FORKSRV_INIT_TMOUT: time spent waiting for forkserver during startup (in ms)\n"
+      "AFL_KILL_SIGNAL: Signal ID delivered to child processes on timeout, etc.\n"
+      "                 (default: SIGKILL)\n"
+      "AFL_FORK_SERVER_KILL_SIGNAL: Kill signal for the fork server on termination\n"
+      "                             (default: SIGTERM). If unset and AFL_KILL_SIGNAL is\n"
+      "                             set, that value will be used.\n"
       "AFL_MAP_SIZE: the shared memory size for that target. must be >= the size\n"
       "              the target was compiled for\n"
       "AFL_PRELOAD:  LD_PRELOAD / DYLD_INSERT_LIBRARIES settings for target\n"
+      "AFL_INPUT_PLACEHOLDER: custom placeholder for input file (default: @@)\n"
       "AFL_TMIN_EXACT: require execution paths to match for crashing inputs\n"
       "AFL_NO_FORKSRV: run target via execve instead of using the forkserver\n"
       "ASAN_OPTIONS: custom settings for ASAN\n"
@@ -893,8 +1088,9 @@ static void usage(u8 *argv0) {
 
 int main(int argc, char **argv_orig, char **envp) {
 
-  s32    opt;
-  u8     mem_limit_given = 0, timeout_given = 0, unicorn_mode = 0, use_wine = 0;
+  s32 opt;
+  u8  mem_limit_given = 0, timeout_given = 0, unicorn_mode = 0, use_wine = 0,
+     del_limit_given = 0;
   char **use_argv;
 
   char **argv = argv_cpy_dup(argc, argv_orig);
@@ -910,7 +1106,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   SAYF(cCYA "afl-tmin" VERSION cRST " by Michal Zalewski\n");
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:B:xeOQUWHh")) > 0) {
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:l:B:xeAOQUWXYHhK:")) > 0) {
 
     switch (opt) {
 
@@ -1022,12 +1218,23 @@ int main(int argc, char **argv_orig, char **envp) {
 
         break;
 
+      case 'A':                                           /* CoreSight mode */
+
+#if !defined(__aarch64__) || !defined(__linux__)
+        FATAL("-A option is not supported on this platform");
+#endif
+
+        if (fsrv->cs_mode) { FATAL("Multiple -A options not supported"); }
+
+        fsrv->cs_mode = 1;
+        break;
+
       case 'O':                                               /* FRIDA mode */
 
         if (fsrv->frida_mode) { FATAL("Multiple -O options not supported"); }
 
         fsrv->frida_mode = 1;
-        setenv("AFL_FRIDA_INST_SEED", "0x0", 1);
+        setenv("AFL_FRIDA_INST_SEED", "1", 1);
 
         break;
 
@@ -1045,6 +1252,7 @@ int main(int argc, char **argv_orig, char **envp) {
         if (!mem_limit_given) { fsrv->mem_limit = MEM_LIMIT_UNICORN; }
 
         unicorn_mode = 1;
+        fsrv->unicorn_mode = 1;
         break;
 
       case 'W':                                           /* Wine+QEMU mode */
@@ -1057,11 +1265,28 @@ int main(int argc, char **argv_orig, char **envp) {
 
         break;
 
+      case 'Y':  // fallthrough
+#ifdef __linux__
+      case 'X':                                                 /* NYX mode */
+
+        if (fsrv->nyx_mode) { FATAL("Multiple -X options not supported"); }
+
+        fsrv->nyx_mode = 1;
+        fsrv->nyx_parent = true;
+        fsrv->nyx_standalone = true;
+
+        break;
+#else
+      case 'X':
+        FATAL("Nyx mode is only available on linux...");
+        break;
+#endif
+
       case 'H':                                                /* Hang Mode */
 
         /* Minimizes a testcase to the minimum that still times out */
 
-        if (hang_mode) { FATAL("Multipe -H options not supported"); }
+        if (hang_mode) { FATAL("Multiple -H options not supported"); }
         if (edges_only) {
 
           FATAL("Edges only and hang mode are mutually exclusive.");
@@ -1091,10 +1316,53 @@ int main(int argc, char **argv_orig, char **envp) {
         read_bitmap(optarg, mask_bitmap, map_size);
         break;
 
+      case 'l':
+        if (del_limit_given) { FATAL("Multiple -l options not supported"); }
+        del_limit_given = 1;
+
+        if (!optarg) { FATAL("Wrong usage of -l"); }
+
+        if (optarg[0] == '-') { FATAL("Dangerously low value of -l"); }
+
+        del_len_limit = atoi(optarg);
+
+        if (del_len_limit < 1 || del_len_limit > TMIN_MAX_FILE) {
+
+          FATAL("Value of -l out of range between 1 and TMIN_MAX_FILE");
+
+        }
+
+        break;
+
       case 'h':
         usage(argv[0]);
         return -1;
         break;
+
+#ifdef __linux__
+      case 'K':                                                 /* GUI mode */
+        if (afl->fsrv.gui_mode) { FATAL("Multiple -K options not supported"); }
+        if (!optarg || optarg[0] == '-') {
+
+          FATAL(
+              "No directory provided for GUI interaction script. "
+              "Use custom_mutators/guifuzz/guifuzz_clicks.py");
+
+        } else {
+
+          afl->fsrv.gui_python_dir = ck_strdup(optarg);
+          afl->fsrv.gui_mode = 1;
+
+        }
+
+        break;
+
+#else
+      case 'K':
+        FATAL("GUI mode is only available on linux...");
+        break;
+
+#endif
 
       default:
         usage(argv[0]);
@@ -1122,9 +1390,25 @@ int main(int argc, char **argv_orig, char **envp) {
 
   set_up_environment(fsrv, argv);
 
+#ifdef __linux__
+  if (!fsrv->nyx_mode) {
+
+    fsrv->target_path = find_binary(argv[optind]);
+
+  } else {
+
+    fsrv->target_path = ck_strdup(argv[optind]);
+
+  }
+
+#else
   fsrv->target_path = find_binary(argv[optind]);
-  fsrv->trace_bits = afl_shm_init(&shm, map_size, 0);
+#endif
+
+  fsrv->trace_bits = afl_shm_init(&shm, map_size, 0, DEFAULT_PERMISSION, -1);
+  fsrv->child_sync_offset = shm.child_sync_offset;
   detect_file_args(argv + optind, out_file, &fsrv->use_stdin);
+  signal(SIGALRM, kill_child);
 
   if (fsrv->qemu_mode) {
 
@@ -1139,6 +1423,31 @@ int main(int argc, char **argv_orig, char **envp) {
                                argv + optind);
 
     }
+
+  } else if (fsrv->cs_mode) {
+
+    use_argv =
+        get_cs_argv(argv[0], &fsrv->target_path, argc - optind, argv + optind);
+
+#ifdef __linux__
+
+  } else if (fsrv->nyx_mode) {
+
+    fsrv->nyx_id = 0;
+
+    u8 *libnyx_binary = find_afl_binary(argv[0], "libnyx.so");
+    fsrv->nyx_handlers = afl_load_libnyx_plugin(libnyx_binary);
+    if (fsrv->nyx_handlers == NULL) {
+
+      FATAL("failed to initialize libnyx.so...");
+
+    }
+
+    fsrv->nyx_use_tmp_workdir = true;
+    fsrv->nyx_bind_cpu_id = 0;
+
+    use_argv = argv + optind;
+#endif
 
   } else {
 
@@ -1170,91 +1479,76 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
-  fsrv->kill_signal =
-      parse_afl_kill_signal_env(getenv("AFL_KILL_SIGNAL"), SIGKILL);
+  configure_afl_kill_signals(
+      fsrv, NULL, NULL, (fsrv->qemu_mode || unicorn_mode) ? SIGKILL : SIGTERM);
 
-  if (getenv("AFL_CRASH_EXITCODE")) {
-
-    long exitcode = strtol(getenv("AFL_CRASH_EXITCODE"), NULL, 10);
-    if ((!exitcode && (errno == EINVAL || errno == ERANGE)) ||
-        exitcode < -127 || exitcode > 128) {
-
-      FATAL("Invalid crash exitcode, expected -127 to 128, but got %s",
-            getenv("AFL_CRASH_EXITCODE"));
-
-    }
-
-    fsrv->uses_crash_exitcode = true;
-    // WEXITSTATUS is 8 bit unsigned
-    fsrv->crash_exitcode = (u8)exitcode;
-
-  }
+  configure_afl_crash_exitcode(fsrv, getenv("AFL_CRASH_EXITCODE"));
 
   shm_fuzz = ck_alloc(sizeof(sharedmem_t));
 
   /* initialize cmplog_mode */
   shm_fuzz->cmplog_mode = 0;
-  u8 *map = afl_shm_init(shm_fuzz, MAX_FILE + sizeof(u32), 1);
+
+  size_t shm_fuzz_map_size = SHM_FUZZ_MAP_SIZE_DEFAULT;
+  u8    *map = afl_shm_init(shm_fuzz, SHM_FUZZ_MAP_SIZE_DEFAULT, 1,
+                            DEFAULT_PERMISSION, -1);
   shm_fuzz->shmemfuzz_mode = 1;
   if (!map) { FATAL("BUG: Zero return from afl_shm_init."); }
-#ifdef USEMMAP
-  setenv(SHM_FUZZ_ENV_VAR, shm_fuzz->g_shm_file_path, 1);
-#else
-  u8 *shm_str = alloc_printf("%d", shm_fuzz->shm_id);
-  setenv(SHM_FUZZ_ENV_VAR, shm_str, 1);
-  ck_free(shm_str);
-#endif
+
+  u8 *shm_fuzz_map_size_str = alloc_printf("%zu", shm_fuzz_map_size);
+  setenv(SHM_FUZZ_MAP_SIZE_ENV_VAR, shm_fuzz_map_size_str, 1);
+  ck_free(shm_fuzz_map_size_str);
+
+  afl_shm_fuzz_env_set(shm_fuzz);
+
   fsrv->support_shmem_fuzz = 1;
   fsrv->shmem_fuzz_len = (u32 *)map;
   fsrv->shmem_fuzz = map + sizeof(u32);
 
   read_initial_file();
 
-  if (!fsrv->qemu_mode && !unicorn_mode) {
+  // Initialize AFL state for custom mutators
+  afl = calloc(1, sizeof(afl_state_t));
+  if (afl) {
 
-    fsrv->map_size = 4194304;  // dummy temporary value
-    u32 new_map_size =
-        afl_fsrv_get_mapsize(fsrv, use_argv, &stop_soon,
-                             (get_afl_env("AFL_DEBUG_CHILD") ||
-                              get_afl_env("AFL_DEBUG_CHILD_OUTPUT"))
-                                 ? 1
-                                 : 0);
+    list_init(&afl->custom_mutator_list);
+    afl->custom_mutators_count = 0;
 
-    if (new_map_size) {
+    memcpy(&afl->fsrv, fsrv, sizeof(afl_forkserver_t));
 
-      if (map_size < new_map_size ||
-          (new_map_size > map_size && new_map_size - map_size > MAP_SIZE)) {
+    afl->fsrv.dev_urandom_fd = open("/dev/urandom", O_RDONLY);
+    if (afl->fsrv.dev_urandom_fd < 0) { PFATAL("Unable to open /dev/urandom"); }
 
-        if (!be_quiet)
-          ACTF("Aquired new map size for target: %u bytes\n", new_map_size);
+    afl->afl_env.afl_custom_mutator_library =
+        getenv("AFL_CUSTOM_MUTATOR_LIBRARY");
+    afl->afl_env.afl_python_module = getenv("AFL_PYTHON_MODULE");
 
-        afl_shm_deinit(&shm);
-        afl_fsrv_kill(fsrv);
-        fsrv->map_size = new_map_size;
-        fsrv->trace_bits = afl_shm_init(&shm, new_map_size, 0);
-        afl_fsrv_start(fsrv, use_argv, &stop_soon,
-                       (get_afl_env("AFL_DEBUG_CHILD") ||
-                        get_afl_env("AFL_DEBUG_CHILD_OUTPUT"))
-                           ? 1
-                           : 0);
+    afl->shm = shm;
+    afl->out_dir = dirname(in_file);
+    afl->debug = debug;
 
-      }
-
-      map_size = new_map_size;
-
-    }
-
-    fsrv->map_size = map_size;
-
-  } else {
-
-    afl_fsrv_start(fsrv, use_argv, &stop_soon,
-                   (get_afl_env("AFL_DEBUG_CHILD") ||
-                    get_afl_env("AFL_DEBUG_CHILD_OUTPUT"))
-                       ? 1
-                       : 0);
+    setup_custom_mutators(afl);
 
   }
+
+#ifdef __linux__
+  if (!fsrv->nyx_mode) { (void)check_binary_signatures(fsrv->target_path); }
+#else
+  (void)check_binary_signatures(fsrv->target_path);
+#endif
+
+  u32 save_be_quiet = be_quiet;
+  be_quiet = !debug;
+
+  afl_fsrv_resize_mapsize(fsrv, &shm, use_argv, map_size, &stop_soon,
+                          unicorn_mode);
+
+  be_quiet = save_be_quiet;
+
+  /* The handshake, and the IJON/bug-pass trim that follows it, are what
+     establish the real coverage size. Everything below walks the map with the
+     local copy. */
+  map_size = fsrv->map_size;
 
   if (fsrv->support_shmem_fuzz && !fsrv->use_shmem_fuzz)
     shm_fuzz = deinit_shmem(fsrv, shm_fuzz);

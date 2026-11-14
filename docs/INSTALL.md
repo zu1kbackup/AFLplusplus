@@ -1,237 +1,220 @@
-# Installation instructions
+# Building and installing AFL++
 
-  This document provides basic installation instructions and discusses known
-  issues for a variety of platforms. See README.md for the general instruction
-  manual.
+## Linux on x86
 
-## 1. Linux on x86
----------------
+An easy way to install AFL++ with everything compiled is available via docker:
+You can use the [Dockerfile](../Dockerfile) or just pull directly from the
+Docker Hub (for x86_64 and arm64):
 
-This platform is expected to work well. Compile the program with:
-
-```bash
-make
+```shell
+docker pull aflplusplus/aflplusplus:latest
+docker run -ti -v /location/of/your/target:/src aflplusplus/aflplusplus
 ```
 
-You can start using the fuzzer without installation, but it is also possible to
-install it with:
+This image is automatically generated when a push to the stable branch happens.
+You will find your target source code in `/src` in the container.
 
-```bash
+Note: you can also pull `aflplusplus/aflplusplus:dev` which is the most current
+development state of AFL++.
+
+If you want to build AFL++ yourself, you have many options. The easiest choice
+is to build and install everything:
+
+NOTE: depending on your Debian/Ubuntu/Kali/... release, replace `-18` with
+whatever llvm version is available. We recommend llvm 18 or newer, minimum is 14.
+
+```shell
+sudo apt-get update
+sudo apt-get install -y build-essential python3-dev automake cmake git flex bison libglib2.0-dev libpixman-1-dev python3-setuptools cargo libgtk-3-dev
+# try to install llvm-18 and install the distro default if that fails
+sudo apt-get install -y lld-18 llvm-18 llvm-18-dev clang-18 || sudo apt-get install -y lld llvm llvm-dev clang
+sudo apt-get install -y gcc-$(gcc --version|head -n1|sed 's/\..*//'|sed 's/.* //')-plugin-dev libstdc++-$(gcc --version|head -n1|sed 's/\..*//'|sed 's/.* //')-dev
+sudo apt-get install -y meson ninja-build # for QEMU mode
+sudo apt-get install -y cpio libcapstone-dev # for Nyx mode
+sudo apt-get install -y wget curl # for Frida mode
+sudo apt-get install -y python3-pip # for Unicorn mode
+git clone https://github.com/AFLplusplus/AFLplusplus
+cd AFLplusplus
+git submodule update --init
+make distrib
 sudo make install
 ```
 
-There are no special dependencies to speak of; you will need GNU make and a
-working compiler (gcc or clang). Some of the optional scripts bundled with the
-program may depend on bash, gdb, and similar basic tools.
+It is recommended to install the newest available gcc, clang and llvm-dev
+possible in your distribution!
 
-If you are using clang, please review README.llvm.md; the LLVM
-integration mode can offer substantial performance gains compared to the
-traditional approach.
+Note that `make distrib` also builds FRIDA mode, QEMU mode, unicorn_mode, and
+more. If you just want plain AFL++, then do `make all`. If you want some
+assisting tooling compiled but are not interested in binary-only targets, then
+instead choose:
 
-Likewise, if you are using GCC, please review instrumentation/README.gcc_plugin.md.
-
-You may have to change several settings to get optimal results (most notably,
-disable crash reporting utilities and switch to a different CPU governor), but
-afl-fuzz will guide you through that if necessary.
-
-## 2. OpenBSD, FreeBSD, NetBSD on x86
-
-Similarly to Linux, these platforms are expected to work well and are
-regularly tested. Compile everything with GNU make:
-
-```bash
-gmake
+```shell
+make source-only
 ```
 
-Note that BSD make will *not* work; if you do not have gmake on your system,
-please install it first. As on Linux, you can use the fuzzer itself without
-installation, or install it with:
+These build targets exist:
 
+* all: the main AFL++ binaries and llvm/gcc instrumentation
+* binary-only: everything for binary-only fuzzing: frida_mode, nyx_mode,
+  qemu_mode, frida_mode, unicorn_mode, coresight_mode, libdislocator,
+  libtokencap
+* source-only: everything for source code fuzzing: nyx_mode, libdislocator,
+  libtokencap
+* distrib: everything (for both binary-only and source code fuzzing)
+* man: creates simple man pages from the help option of the programs
+* install: installs everything you have compiled with the build options above
+* clean: cleans everything compiled, not downloads (unless not on a checkout)
+* deepclean: cleans everything including downloads
+* code-format: format the code, do this before you commit and send a PR please!
+* tests: runs test cases to ensure that all features are still working as they
+  should
+* unit: perform unit tests (based on cmocka)
+* help: shows these build options
+
+[Unless you are on macOS](https://developer.apple.com/library/archive/qa/qa1118/_index.html),
+you can also build statically linked versions of the AFL++ binaries by passing
+the `PERFORMANCE=1` argument to make:
+
+```shell
+make PERFORMANCE=1
 ```
-sudo gmake install
+
+These build options exist:
+
+* PERFORMANCE - compile with performance options that make the binary not transferable to other systems. Recommended (except on macOS)!
+* STATIC - compile AFL++ static (does not work on macOS)
+* CODE_COVERAGE - compile the target for code coverage (see [README.llvm.md](../instrumentation/README.llvm.md))
+* ASAN_BUILD - compiles AFL++ with address sanitizer for debug purposes
+* UBSAN_BUILD - compiles AFL++ tools with undefined behaviour sanitizer for debug purposes
+* DEBUG - no optimization, -ggdb3, all warnings and -Werror
+* LLVM_DEBUG - shows llvm deprecation warnings
+* PROFILING - compile afl-fuzz with profiling information
+* INTROSPECTION - compile afl-fuzz with mutation introspection
+* NO_PYTHON - disable python support
+* NO_UTF - do not use UTF-8 for line rendering in status screen (fallback to G1 box drawing, of vanilla AFL)
+* NO_NYX - disable building nyx mode dependencies
+* NO_CORESIGHT - disable building coresight (arm64 only)
+* NO_QEMU - disable building QEMU support
+* NO_FRIDA - disable building FRIDA support
+* NO_UNICORN - disable building unicorn
+* NO_UNICORN_ARM64 - disable building unicorn on arm64
+* AFL_NO_X86 - if compiling on non-Intel/AMD platforms
+* LLVM_CONFIG - if your distro doesn't use the standard name for llvm-config (e.g., Debian)
+
+e.g.: `make LLVM_CONFIG=llvm-config-18`
+
+## macOS on x86_64 and arm64
+
+macOS has some gotchas due to the idiosyncrasies of the platform.
+
+macOS supports SYSV shared memory used by AFL++'s instrumentation, but the
+default settings aren't sufficient. Before even building, increase
+them by running the provided script:
+
+```shell
+sudo afl-system-config
 ```
 
-Keep in mind that if you are using csh as your shell, the syntax of some of the
-shell commands given in the README.md and other docs will be different.
+See
+[https://www.spy-hill.com/help/apple/SharedMemory.html](https://www.spy-hill.com/help/apple/SharedMemory.html)
+for documentation for the shared memory settings and how to make them permanent.
 
-The `llvm` requires a dynamically linked, fully-operational installation of
-clang. At least on FreeBSD, the clang binaries are static and do not include
-some of the essential tools, so if you want to make it work, you may need to
-follow the instructions in README.llvm.md.
+Next, to build AFL++, install the following packages from brew (use `@version`
+install a specific version):
 
-Beyond that, everything should work as advertised.
-
-The QEMU mode is currently supported only on Linux. I think it's just a QEMU
-problem, I couldn't get a vanilla copy of user-mode emulation support working
-correctly on BSD at all.
-
-## 3. MacOS X on x86 and arm64 (M1)
-
-MacOS X should work, but there are some gotchas due to the idiosyncrasies of
-the platform. On top of this, I have limited release testing capabilities
-and depend mostly on user feedback.
-
-To build AFL, install llvm (and perhaps gcc) from brew and follow the general
-instructions for Linux. If possible avoid Xcode at all cost.
-
-`brew install wget git make cmake llvm gdb`
-
-Be sure to setup PATH to point to the correct clang binaries and use the
-freshly installed clang, clang++ and gmake, e.g.:
-
+```shell
+brew install wget git make cmake llvm lld gdb coreutils
 ```
-export PATH="/usr/local/Cellar/llvm/12.0.1/bin/:$PATH"
+
+Depending on your macOS system + brew version, brew may be installed in different places.
+You can check with `brew info llvm` to know where, then create a variable for it:
+
+```shell
+export HOMEBREW_BASE="/opt/homebrew/opt"
+```
+
+or
+
+```shell
+export HOMEBREW_BASE="/usr/local/opt"
+```
+
+Set `PATH` to point to the brew clang, clang++, llvm-config, gmake and coreutils.
+Also use the brew clang compiler; the Xcode clang compiler must not be used.
+
+```shell
+export PATH="$HOMEBREW_BASE/coreutils/libexec/gnubin:/usr/local/bin:$HOMEBREW_BASE/llvm/bin:$PATH"
 export CC=clang
 export CXX=clang++
-gmake
-cd frida_mode
-gmake
-cd ..
-gmake install
 ```
 
-afl-gcc will fail unless you have GCC installed, but that is using outdated
-instrumentation anyway. You don't want that.
-Note that afl-clang-lto, afl-gcc-fast and qemu_mode are not working on MacOS.
+Then build following the general Linux instructions.
 
-The crash reporting daemon that comes by default with MacOS X will cause
-problems with fuzzing. You need to turn it off:
-```
-launchctl unload -w /System/Library/LaunchAgents/com.apple.ReportCrash.plist
-sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.ReportCrash.Root.plist
+If everything worked, you should then have `afl-clang-fast` installed, which you can check with:
+
+```shell
+which afl-clang-fast
 ```
 
-The `fork()` semantics on OS X are a bit unusual compared to other unix systems
+Note that `afl-clang-lto`, `afl-gcc-fast` and `qemu_mode` are not working on macOS.
+
+The crash reporting daemon that comes by default with macOS will cause
+problems with fuzzing. You need to turn it off, which you can do with `afl-system-config`.
+
+The `fork()` semantics on macOS are a bit unusual compared to other unix systems
 and definitely don't look POSIX-compliant. This means two things:
 
   - Fuzzing will be probably slower than on Linux. In fact, some folks report
     considerable performance gains by running the jobs inside a Linux VM on
-    MacOS X.
-  - Some non-portable, platform-specific code may be incompatible with the
-    AFL forkserver. If you run into any problems, set `AFL_NO_FORKSRV=1` in the
+    macOS.
+  - Some non-portable, platform-specific code may be incompatible with the AFL++
+    forkserver. If you run into any problems, set `AFL_NO_FORKSRV=1` in the
     environment before starting afl-fuzz.
 
-User emulation mode of QEMU does not appear to be supported on MacOS X, so
-black-box instrumentation mode (`-Q`) will not work.
-However Frida mode (`-O`) should work on x86 and arm64 MacOS boxes.
+User emulation mode of QEMU does not appear to be supported on macOS, so
+black-box instrumentation mode (`-Q`) will not work. However, FRIDA mode (`-O`)
+works on both x86 and arm64 macOS boxes.
 
-MacOS X supports SYSV shared memory used by AFL's instrumentation, but the
-default settings aren't usable with AFL++. The default settings on 10.14 seem
-to be:
+## iOS on arm64 and arm64e
 
-```bash
-$ ipcs -M
-IPC status from <running system> as of XXX
-shminfo:
-        shmmax: 4194304 (max shared memory segment size)
-        shmmin:       1 (min shared memory segment size)
-        shmmni:      32 (max number of shared memory identifiers)
-        shmseg:       8 (max shared memory segments per process)
-        shmall:    1024 (max amount of shared memory in pages)
+**Option 1: Compilation on jailbroken iOS (recommended)**
+
+To compile directly on a jailbroken iOS device, it is recommended to use a jailbreak that supports Procursus,
+as Procursus provides up-to-date pre-built packages for the required tools.
+
+Ensure `openssh` is installed on your iOS device, then SSH into it.
+Install the following packages:
+
+```shell
+sudo apt install wget git make cmake clang gawk llvm ldid coreutils build-essential xz-utils
 ```
 
-To temporarily change your settings to something minimally usable with AFL++,
-run these commands as root:
+Configure the environment for compilation:
 
-```bash
-sysctl kern.sysv.shmmax=8388608
-sysctl kern.sysv.shmall=4096
+```shell
+export IOS_SDK_PATH="/usr/share/SDKs/iPhoneOS.sdk"
+export CC=clang
+export CXX=clang++
 ```
 
-If you're running more than one instance of AFL you likely want to make `shmall`
-bigger and increase `shmseg` as well:
+Then build following the general Linux instructions.
 
-```bash
-sysctl kern.sysv.shmmax=8388608
-sysctl kern.sysv.shmseg=48
-sysctl kern.sysv.shmall=98304
+**Option 2: Cross-Compilation on macOS for Jailbroken iOS**
+
+In addition to the packages required for a macOS build, install `ldid` for signing binaries:
+
+```shell
+brew install ldid-procursus
 ```
 
-See http://www.spy-hill.com/help/apple/SharedMemory.html for documentation for
-these settings and how to make them permanent.
+Configure the environment for compilation:
 
-## 4. Linux or *BSD on non-x86 systems
-
-Standard build will fail on non-x86 systems, but you should be able to
-leverage two other options:
-
-  - The LLVM mode (see README.llvm.md), which does not rely on
-    x86-specific assembly shims. It's fast and robust, but requires a
-    complete installation of clang.
-  - The QEMU mode (see qemu_mode/README.md), which can be also used for
-    fuzzing cross-platform binaries. It's slower and more fragile, but
-    can be used even when you don't have the source for the tested app.
-
-If you're not sure what you need, you need the LLVM mode, which is built by
-default.
-
-...and compile your target program with afl-clang-fast or afl-clang-fast++
-instead of the traditional afl-gcc or afl-clang wrappers.
-
-## 5. Solaris on x86
-
-The fuzzer reportedly works on Solaris, but I have not tested this first-hand,
-and the user base is fairly small, so I don't have a lot of feedback.
-
-To get the ball rolling, you will need to use GNU make and GCC or clang. I'm
-being told that the stock version of GCC that comes with the platform does not
-work properly due to its reliance on a hardcoded location for 'as' (completely
-ignoring the `-B` parameter or `$PATH`).
-
-To fix this, you may want to build stock GCC from the source, like so:
-
-```sh
-./configure --prefix=$HOME/gcc --with-gnu-as --with-gnu-ld \
-  --with-gmp-include=/usr/include/gmp --with-mpfr-include=/usr/include/mpfr
-make
-sudo make install
+```shell
+export IOS_SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+export CC="$(xcrun --sdk iphoneos -f clang) -target arm64-apple-ios14.0"
+export CXX="$(xcrun --sdk iphoneos -f clang++) -target arm64-apple-ios14.0"
+export HOST_CC=cc
 ```
 
-Do *not* specify `--with-as=/usr/gnu/bin/as` - this will produce a GCC binary that
-ignores the `-B` flag and you will be back to square one.
-
-Note that Solaris reportedly comes with crash reporting enabled, which causes
-problems with crashes being misinterpreted as hangs, similarly to the gotchas
-for Linux and MacOS X. AFL does not auto-detect crash reporting on this
-particular platform, but you may need to run the following command:
-
-```sh
-coreadm -d global -d global-setid -d process -d proc-setid \
-  -d kzone -d log
-```
-
-User emulation mode of QEMU is not available on Solaris, so black-box
-instrumentation mode (`-Q`) will not work.
-
-## 6. Everything else
-
-You're on your own. On POSIX-compliant systems, you may be able to compile and
-run the fuzzer; and the LLVM and GCC plugin modes may offer a way to instrument
-non-x86 code.
-
-The fuzzer will run on Windows in WSL only. It will not work under Cygwin on in the normal Windows world. It
-could be ported to the latter platform fairly easily, but it's a pretty bad
-idea, because Cygwin is extremely slow. It makes much more sense to use
-VirtualBox or so to run a hardware-accelerated Linux VM; it will run around
-20x faster or so. If you have a *really* compelling use case for Cygwin, let
-me know.
-
-Although Android on x86 should theoretically work, the stock kernel may have
-SHM support compiled out, and if so, you may have to address that issue first.
-It's possible that all you need is this workaround:
-
-  https://github.com/pelya/android-shmem
-
-Joshua J. Drake notes that the Android linker adds a shim that automatically
-intercepts `SIGSEGV` and related signals. To fix this issue and be able to see
-crashes, you need to put this at the beginning of the fuzzed program:
-
-```sh
-  signal(SIGILL, SIG_DFL);
-  signal(SIGABRT, SIG_DFL);
-  signal(SIGBUS, SIG_DFL);
-  signal(SIGFPE, SIG_DFL);
-  signal(SIGSEGV, SIG_DFL);
-```
-
-You may need to `#include <signal.h>` first.
+Then build following the general Linux instructions.
+Finally, transfer the binaries to your iOS device.

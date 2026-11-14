@@ -13,16 +13,23 @@ test -z "$AFL_CC" && {
   fi
 }
 
+if test -n "$CPU_TARGET_CC"; then
+    $ECHO "$GREY[*] Using $CPU_TARGET_CC as compiler for target"
+else
+    CPU_TARGET_CC=cc
+fi
+
 test -e ../afl-qemu-trace && {
-  cc -pie -fPIE -o test-instr ../test-instr.c
-  cc -o test-compcov test-compcov.c
-  test -e test-instr -a -e test-compcov && {
+  ${CPU_TARGET_CC} -pie -fPIE -o test-instr ../test-instr.c
+  ${CPU_TARGET_CC} -o test-compcov test-compcov.c
+  ${CPU_TARGET_CC} -pie -fPIE -o test-instr-exit-at-end -DEXIT_AT_END ../test-instr.c
+  test -e test-instr -a -e test-compcov -a -e test-instr-exit-at-end && {
     {
       mkdir -p in
       echo 00000 > in/in
       $ECHO "$GREY[*] running afl-fuzz for qemu_mode, this will take approx 10 seconds"
       {
-        ../afl-fuzz -m ${MEM_LIMIT} -V10 -Q -i in -o out -- ./test-instr >>errors 2>&1
+        ../afl-fuzz -m ${MEM_LIMIT} -V07 -Q -i in -o out -- ./test-instr >>errors 2>&1
       } >>errors 2>&1
       test -n "$( ls out/default/queue/id:000002* 2>/dev/null )" && {
         $ECHO "$GREEN[+] afl-fuzz is working correctly with qemu_mode"
@@ -63,7 +70,7 @@ test -e ../afl-qemu-trace && {
           {
             export AFL_PRELOAD=../libcompcov.so
             export AFL_COMPCOV_LEVEL=2
-            ../afl-fuzz -m ${MEM_LIMIT} -V10 -Q -i in -o out -- ./test-compcov >>errors 2>&1
+            AFL_NO_UI=1 ../afl-fuzz -V07 -Q -i in -o out -- ./test-compcov 2>&1
             unset AFL_PRELOAD
             unset AFL_COMPCOV_LEVEL
           } >>errors 2>&1
@@ -88,7 +95,7 @@ test -e ../afl-qemu-trace && {
       test "$SYS" = "i686" -o "$SYS" = "x86_64" -o "$SYS" = "amd64" -o "$SYS" = "i86pc" -o "$SYS" = "aarch64" -o ! "${SYS%%arm*}" && {
         $ECHO "$GREY[*] running afl-fuzz for qemu_mode cmplog, this will take approx 10 seconds"
         {
-          ../afl-fuzz -m none -V10 -Q -c 0 -i in -o out -- ./test-compcov >>errors 2>&1
+          ../afl-fuzz -V07 -Q -c 0 -l 3 -i in -o out -- ./test-compcov >>errors 2>&1
         } >>errors 2>&1
         test -n "$( ls out/default/queue/id:000001* 2>/dev/null )" && {
           $ECHO "$GREEN[+] afl-fuzz is working correctly with qemu_mode cmplog"
@@ -104,22 +111,34 @@ test -e ../afl-qemu-trace && {
        $ECHO "$YELLOW[-] not an intel or arm platform, cannot test qemu_mode cmplog"
       }
 
-      test "$SYS" = "i686" -o "$SYS" = "x86_64" -o "$SYS" = "amd64" -o "$SYS" = "i86pc" -o "$SYS" = "aarch64" -o ! "${SYS%%arm*}" && {
+      test "$SYS" = "i686" -o "$SYS" = "x86_64" -o "$SYS" = "amd64" -o "$SYS" = "i86pc" -o "$SYS" = "aarch64" -o ! "${SYS%%arm*}" -o "$SYS" = "mipsel" && {
         $ECHO "$GREY[*] running afl-fuzz for persistent qemu_mode, this will take approx 10 seconds"
         {
-          if file test-instr | grep -q "32-bit"; then
-            # for 32-bit reduce 8 nibbles to the lower 7 nibbles
-	    ADDR_LOWER_PART=`nm test-instr | grep "T main" | awk '{print $1}' | sed 's/^.//'`
-          else
-            # for 64-bit reduce 16 nibbles to the lower 9 nibbles
-	    ADDR_LOWER_PART=`nm test-instr | grep "T main" | awk '{print $1}' | sed 's/^.......//'`
-          fi
-          export AFL_QEMU_PERSISTENT_ADDR=`expr 0x4${ADDR_LOWER_PART}`
+          IS_STATIC=""
+          file test-instr | grep -q 'statically linked' && IS_STATIC=1
+          test -z "$IS_STATIC" && {
+            if file test-instr | grep -q "32-bit"; then
+              # for 32-bit reduce 8 nibbles to the lower 7 nibbles
+  	      ADDR_LOWER_PART=`nm test-instr | grep "T main" | awk '{print $1}' | sed 's/^.//'`
+              export AFL_QEMU_PERSISTENT_ADDR=`expr 0x4${ADDR_LOWER_PART}`
+            elif [ "$SYS" = "aarch64" ]; then
+              # for aarch64 reduce 16 nibbles to the lower 8 nibbles
+  	      ADDR_LOWER_PART=`nm test-instr | grep "T main" | awk '{print $1}' | sed 's/^........//'`
+              export AFL_QEMU_PERSISTENT_ADDR=`expr 0x55${ADDR_LOWER_PART}`
+            else
+              # for x64 reduce 16 nibbles to the lower 9 nibbles
+  	      ADDR_LOWER_PART=`nm test-instr | grep "T main" | awk '{print $1}' | sed 's/^.......//'`
+              export AFL_QEMU_PERSISTENT_ADDR=`expr 0x4${ADDR_LOWER_PART}`
+            fi
+          }
+          test -n "$IS_STATIC" && {
+            export AFL_QEMU_PERSISTENT_ADDR=0x`nm test-instr | grep "T main" |  awk '{print $1}'`
+          }
           export AFL_QEMU_PERSISTENT_GPR=1
           $ECHO "Info: AFL_QEMU_PERSISTENT_ADDR=$AFL_QEMU_PERSISTENT_ADDR <= $(nm test-instr | grep "T main" | awk '{print $1}')"
           env|grep AFL_|sort
           file test-instr
-          ../afl-fuzz -m ${MEM_LIMIT} -V10 -Q -i in -o out -- ./test-instr
+          ../afl-fuzz -m ${MEM_LIMIT} -V07 -Q -i in -o out -- ./test-instr
           unset AFL_QEMU_PERSISTENT_ADDR
         } >>errors 2>&1
         test -n "$( ls out/default/queue/id:000002* 2>/dev/null )" && {
@@ -142,9 +161,66 @@ test -e ../afl-qemu-trace && {
           $ECHO "$RED[!] afl-fuzz is not working correctly with persistent qemu_mode"
           CODE=1
         }
-        rm -rf in out errors
+        rm -rf out errors
       } || {
        $ECHO "$YELLOW[-] not an intel or arm platform, cannot test persistent qemu_mode"
+      }
+
+      test "$SYS" = "i686" -o "$SYS" = "x86_64" -o "$SYS" = "amd64" -o "$SYS" = "i86pc" -o "$SYS" = "aarch64" -o ! "${SYS%%arm*}" -o "$SYS" = "mipsel" && {
+        $ECHO "$GREY[*] running afl-fuzz for persistent qemu_mode with AFL_QEMU_PERSISTENT_EXITS, this will take approx 10 seconds"
+        {
+          IS_STATIC=""
+          file test-instr-exit-at-end | grep -q 'statically linked' && IS_STATIC=1
+          test -z "$IS_STATIC" && {
+            if file test-instr-exit-at-end | grep -q "32-bit"; then
+              # for 32-bit reduce 8 nibbles to the lower 7 nibbles
+  	      ADDR_LOWER_PART=`nm test-instr-exit-at-end | grep "T main" | awk '{print $1}' | sed 's/^.//'`
+              export AFL_QEMU_PERSISTENT_ADDR=`expr 0x4${ADDR_LOWER_PART}`
+            elif [ "$SYS" = "aarch64" ]; then
+              # for aarch64 reduce 16 nibbles to the lower 8 nibbles
+  	      ADDR_LOWER_PART=`nm test-instr-exit-at-end | grep "T main" | awk '{print $1}' | sed 's/^........//'`
+              export AFL_QEMU_PERSISTENT_ADDR=`expr 0x55${ADDR_LOWER_PART}`
+            else
+              # for x64 reduce 16 nibbles to the lower 9 nibbles
+  	      ADDR_LOWER_PART=`nm test-instr-exit-at-end | grep "T main" | awk '{print $1}' | sed 's/^.......//'`
+              export AFL_QEMU_PERSISTENT_ADDR=`expr 0x4${ADDR_LOWER_PART}`
+            fi
+          }
+          test -n "$IS_STATIC" && {
+            export AFL_QEMU_PERSISTENT_ADDR=0x`nm test-instr-exit-at-end | grep "T main" |  awk '{print $1}'`
+          }
+          export AFL_QEMU_PERSISTENT_GPR=1
+          $ECHO "Info: AFL_QEMU_PERSISTENT_ADDR=$AFL_QEMU_PERSISTENT_ADDR <= $(nm test-instr-exit-at-end | grep "T main" | awk '{print $1}')"
+          export AFL_QEMU_PERSISTENT_EXITS=1
+          ../afl-fuzz -m ${MEM_LIMIT} -V07 -Q -i in -o out -- ./test-instr-exit-at-end
+          echo status "$?"
+          unset AFL_QEMU_PERSISTENT_ADDR
+          unset AFL_QEMU_PERSISTENT_GPR
+          unset AFL_QEMU_PERSISTENT_EXITS
+        } >>errors 2>&1
+        test -n "$( ls out/default/queue/id:000000* 2>/dev/null )" && {
+          $ECHO "$GREEN[+] afl-fuzz is working correctly with persistent qemu_mode and AFL_QEMU_PERSISTENT_EXITS"
+          RUNTIMEP_EXIT=`grep execs_done out/default/fuzzer_stats | awk '{print$3}'`
+          test -n "$RUNTIME" -a -n "$RUNTIMEP_EXIT" && {
+            DIFF=`expr $RUNTIMEP_EXIT / $RUNTIME`
+            test "$DIFF" -gt 1 && { # must be at least twice as fast
+              $ECHO "$GREEN[+] persistent qemu_mode with AFL_QEMU_PERSISTENT_EXITS was noticeable faster than standard qemu_mode"
+            } || {
+              $ECHO "$YELLOW[-] persistent qemu_mode with AFL_QEMU_PERSISTENT_EXITS was not noticeable faster than standard qemu_mode"
+            }
+          } || {
+            $ECHO "$YELLOW[-] we got no data on executions performed? weird!"
+          }
+        } || {
+          echo CUT------------------------------------------------------------------CUT
+          cat errors
+          echo CUT------------------------------------------------------------------CUT
+          $ECHO "$RED[!] afl-fuzz is not working correctly with persistent qemu_mode and AFL_QEMU_PERSISTENT_EXITS"
+          CODE=1
+        }
+        rm -rf in out errors
+      } || {
+       $ECHO "$YELLOW[-] not an intel or arm platform, cannot test persistent qemu_mode with AFL_QEMU_PERSISTENT_EXITS"
       }
 
       test -e ../qemu_mode/unsigaction/unsigaction32.so && {
@@ -165,11 +241,8 @@ test -e ../afl-qemu-trace && {
             CODE=1
           }
         } || {
-          echo CUT------------------------------------------------------------------CUT
-          cat errors
-          echo CUT------------------------------------------------------------------CUT
-	  $ECHO "$RED[!] cannot compile test program (32 bit) for unsigaction library"
-          CODE=1
+	  $ECHO "$YELLOW[-] cannot compile test program (32 bit) for unsigaction library"
+          INCOMPLETE=1
         }
       } || {
         $ECHO "$YELLOW[-] we cannot test qemu_mode unsigaction library (32 bit) because it is not present"
@@ -194,11 +267,8 @@ test -e ../afl-qemu-trace && {
           }
           unset LD_PRELOAD
         } || {
-          echo CUT------------------------------------------------------------------CUT
-          cat errors
-          echo CUT------------------------------------------------------------------CUT
-	  $ECHO "$RED[!] cannot compile test program (64 bit) for unsigaction library"
-          CODE=1
+	  $ECHO "$YELLOW[-] cannot compile test program (64 bit) for unsigaction library"
+          INCOMPLETE=1
         }
       } || {
         $ECHO "$YELLOW[-] we cannot test qemu_mode unsigaction library (64 bit) because it is not present"
@@ -211,7 +281,7 @@ test -e ../afl-qemu-trace && {
     CODE=1
   }
 
-  rm -f test-instr test-compcov
+  rm -f test-instr test-compcov test-instr-exit-at-end
 } || {
   $ECHO "$YELLOW[-] qemu_mode is not compiled, cannot test"
   INCOMPLETE=1

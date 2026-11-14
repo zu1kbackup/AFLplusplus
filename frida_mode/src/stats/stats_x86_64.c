@@ -1,11 +1,9 @@
-#include <sys/shm.h>
 #include <sys/mman.h>
 
 #include "frida-gumjs.h"
 
-#include "debug.h"
-
 #include "ranges.h"
+#include "shm.h"
 #include "stats.h"
 #include "util.h"
 
@@ -48,24 +46,7 @@ static stats_data_arch_t *stats_data_arch = NULL;
 
 void starts_arch_init(void) {
 
-  int shm_id = shmget(IPC_PRIVATE, sizeof(stats_data_arch_t),
-                      IPC_CREAT | IPC_EXCL | 0600);
-  if (shm_id < 0) { FATAL("shm_id < 0 - errno: %d\n", errno); }
-
-  stats_data_arch = shmat(shm_id, NULL, 0);
-  g_assert(stats_data_arch != MAP_FAILED);
-
-  /*
-   * Configure the shared memory region to be removed once the process dies.
-   */
-  if (shmctl(shm_id, IPC_RMID, NULL) < 0) {
-
-    FATAL("shmctl (IPC_RMID) < 0 - errno: %d\n", errno);
-
-  }
-
-  /* Clear it, not sure it's necessary, just seems like good practice */
-  memset(stats_data_arch, '\0', sizeof(stats_data_arch_t));
+  stats_data_arch = shm_create(sizeof(stats_data_arch_t));
 
 }
 
@@ -250,13 +231,13 @@ void stats_write_arch(stats_data_t *data) {
 
 static x86_op_type stats_get_operand_type(const cs_insn *instr) {
 
-  cs_x86 *   x86 = &instr->detail->x86;
+  cs_x86    *x86 = &instr->detail->x86;
   cs_x86_op *operand;
 
   if (x86->op_count != 1) {
 
-    FATAL("Unexpected operand count (%d): %s %s\n", x86->op_count,
-          instr->mnemonic, instr->op_str);
+    FFATAL("Unexpected operand count (%d): %s %s\n", x86->op_count,
+           instr->mnemonic, instr->op_str);
 
   }
 
@@ -268,7 +249,7 @@ static x86_op_type stats_get_operand_type(const cs_insn *instr) {
 
 static void stats_collect_call_imm_excluded_arch(const cs_insn *instr) {
 
-  cs_x86 *   x86 = &instr->detail->x86;
+  cs_x86    *x86 = &instr->detail->x86;
   cs_x86_op *operand = &x86->operands[0];
 
   if (range_is_excluded(GUM_ADDRESS(operand->imm))) {
@@ -295,7 +276,7 @@ static void stats_collect_call_arch(const cs_insn *instr) {
       stats_data_arch->num_call_mem++;
       break;
     default:
-      FATAL("Invalid operand type: %s %s\n", instr->mnemonic, instr->op_str);
+      FFATAL("Invalid operand type: %s %s\n", instr->mnemonic, instr->op_str);
 
   }
 
@@ -316,7 +297,7 @@ static void stats_collect_jump_arch(const cs_insn *instr) {
       stats_data_arch->num_jmp_mem++;
       break;
     default:
-      FATAL("Invalid operand type: %s %s\n", instr->mnemonic, instr->op_str);
+      FFATAL("Invalid operand type: %s %s\n", instr->mnemonic, instr->op_str);
 
   }
 
@@ -337,7 +318,7 @@ static void stats_collect_jump_cond_arch(const cs_insn *instr) {
       stats_data_arch->num_jmp_cond_mem++;
       break;
     default:
-      FATAL("Invalid operand type: %s %s\n", instr->mnemonic, instr->op_str);
+      FFATAL("Invalid operand type: %s %s\n", instr->mnemonic, instr->op_str);
 
   }
 

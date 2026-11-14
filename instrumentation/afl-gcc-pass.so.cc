@@ -1,8 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* GCC plugin for instrumentation of code for american fuzzy lop.
 
    Copyright 2014-2019 Free Software Foundation, Inc
    Copyright 2015, 2016 Google Inc. All rights reserved.
-   Copyright 2019-2020 AdaCore
+   Copyright 2019-2026 AdaCore
 
    Written by Alexandre Oliva <oliva@adacore.com>, based on the AFL
    LLVM pass by Laszlo Szekeres <lszekeres@google.com> and Michal
@@ -30,7 +31,7 @@
    GNU General Public License for more details.
 
    You should have received a copy of the GNU General Public License
-   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+   along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
  */
 
@@ -65,7 +66,6 @@
    The new pass is to be a GIMPLE_PASS.  Given the sort of
    instrumentation it's supposed to do, its todo_flags_finish will
    certainly need TODO_update_ssa, and TODO_cleanup_cfg.
-   TODO_verify_il is probably desirable, at least during debugging.
    TODO_rebuild_cgraph_edges is required only in the out-of-line
    instrumentation mode.
 
@@ -73,13 +73,13 @@
    and optionally inserting one of the instrumentation sequences below
    after its labels, to indicate execution entered the block.
 
-   A block should be skipped if R(100) (from ../types.h) is >= the
+   A block should be skipped if AFL_R(100) (from ../types.h) is >= the
    global instrumentation ratio.
 
    A block may be skipped for other reasons, such as if all of its
    predecessors have a single successor.
 
-   For an instrumented block, a R(MAP_SIZE) say <N> should be
+   For an instrumented block, a AFL_R(MAP_SIZE) say <N> should be
    generated to be used as its location number.  Let <C> be a compiler
    constant built out of it.
 
@@ -124,50 +124,11 @@
    entry edge for the entry block.
 */
 
-#include "../include/config.h"
-#include "../include/debug.h"
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-
-#ifdef likely
-  #undef likely
+#include "afl-gcc-common.h"
+#if defined(__has_include) && __has_include("memmodel.h")
+  #include "memmodel.h"
 #endif
-#ifdef unlikely
-  #undef unlikely
-#endif
-
-#include <list>
-#include <string>
-#include <fstream>
-
-#include <algorithm>
-#include <fnmatch.h>
-
-#include <gcc-plugin.h>
-#include <plugin-version.h>
-#include <toplev.h>
-#include <tree-pass.h>
-#include <context.h>
-#include <tree.h>
-#include <gimplify.h>
-#include <basic-block.h>
-#include <tree-ssa-alias.h>
-#include <gimple-expr.h>
-#include <gimple.h>
-#include <gimple-iterator.h>
-#include <stringpool.h>
-#include <gimple-ssa.h>
-#if (__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + __GNUC_PATCHLEVEL__) >= \
-    60200                                               /* >= version 6.2.0 */
-  #include <tree-vrp.h>
-#endif
-#include <tree-ssanames.h>
-#include <tree-phinodes.h>
-#include <ssa-iterators.h>
-
-#include <intl.h>
+#include <dominance.h>
 
 /* This plugin, being under the same license as GCC, satisfies the
    "GPL-compatible Software" definition in the GCC RUNTIME LIBRARY
@@ -187,16 +148,14 @@ static constexpr struct pass_data afl_pass_data = {
     .properties_provided = 0,
     .properties_destroyed = 0,
     .todo_flags_start = 0,
-    .todo_flags_finish = (TODO_update_ssa | TODO_cleanup_cfg | TODO_verify_il),
+    .todo_flags_finish = (TODO_update_ssa | TODO_cleanup_cfg),
 
 };
 
-struct afl_pass : gimple_opt_pass {
+struct afl_pass : afl_base_pass {
 
   afl_pass(bool quiet, unsigned int ratio)
-      : gimple_opt_pass(afl_pass_data, g),
-        be_quiet(quiet),
-        debug(!!getenv("AFL_DEBUG")),
+      : afl_base_pass(quiet, !!getenv("AFL_DEBUG"), afl_pass_data),
         inst_ratio(ratio),
 #ifdef AFL_GCC_OUT_OF_LINE
         out_of_line(!!(AFL_GCC_OUT_OF_LINE)),
@@ -209,13 +168,6 @@ struct afl_pass : gimple_opt_pass {
     initInstrumentList();
 
   }
-
-  /* Are we outputting to a non-terminal, or running with AFL_QUIET
-     set?  */
-  const bool be_quiet;
-
-  /* Are we running with AFL_DEBUG set?  */
-  const bool debug;
 
   /* How likely (%) is a block to be instrumented?  */
   const unsigned int inst_ratio;
@@ -236,6 +188,12 @@ struct afl_pass : gimple_opt_pass {
 
     int blocks = 0;
 
+    /* Track whether we split any blocks (e.g., for returns_twice handling).  */
+    bool did_split = false;
+
+    /* Track blocks we've created trampolines for, to avoid reprocessing.  */
+    hash_set<basic_block> returns_twice_handled;
+
     /* These are temporaries used by inline instrumentation only, that
        are live throughout the function.  */
     tree ploc = NULL, indx = NULL, map = NULL, map_ptr = NULL, ntry = NULL,
@@ -244,10 +202,12 @@ struct afl_pass : gimple_opt_pass {
     basic_block bb;
     FOR_EACH_BB_FN(bb, fn) {
 
-      if (!instrument_block_p(bb)) continue;
+      if (!instrument_block_p(fn, bb)) continue;
+
+      if (returns_twice_handled.contains(bb)) continue;
 
       /* Generate the block identifier.  */
-      unsigned bid = R(MAP_SIZE);
+      unsigned bid = AFL_R(MAP_SIZE);
       tree     bidt = build_int_cst(sizetype, bid);
 
       gimple_seq seq = NULL;
@@ -297,20 +257,21 @@ struct afl_pass : gimple_opt_pass {
             gimple_build_assign(ntry, POINTER_PLUS_EXPR, map_ptr, indx);
         gimple_seq_add_stmt(&seq, idx_map);
 
-        /* Increment the counter in idx_map.  */
-        tree memref = build2(MEM_REF, TREE_TYPE(TREE_TYPE(ntry)), ntry,
-                             build_zero_cst(TREE_TYPE(ntry)));
-        if (blocks == 0)
-          cntr = create_tmp_var(TREE_TYPE(memref), ".afl_edge_count");
-
-        /* Load the count from the entry.  */
-        auto load_cntr = gimple_build_assign(cntr, memref);
-        gimple_seq_add_stmt(&seq, load_cntr);
-
         /* Prepare to add constant 1 to it.  */
-        tree incrv = build_one_cst(TREE_TYPE(cntr));
+        tree incrv = build_one_cst(TREE_TYPE(TREE_TYPE(ntry)));
 
         if (neverZero) {
+
+          /* Increment the counter in idx_map.  */
+          tree memref = build2(MEM_REF, TREE_TYPE(TREE_TYPE(ntry)), ntry,
+                               build_zero_cst(TREE_TYPE(ntry)));
+
+          if (blocks == 0)
+            cntr = create_tmp_var(TREE_TYPE(memref), ".afl_edge_count");
+
+          /* Load the count from the entry.  */
+          auto load_cntr = gimple_build_assign(cntr, memref);
+          gimple_seq_add_stmt(&seq, load_cntr);
 
           /* NeverZero: if count wrapped around to zero, advance to
              one.  */
@@ -348,15 +309,24 @@ struct afl_pass : gimple_opt_pass {
              in xincr.  */
           incrv = xincr;
 
+          /* Add the increment (1 or the overflow bit) to count.  */
+          auto incr_cntr = gimple_build_assign(cntr, PLUS_EXPR, cntr, incrv);
+          gimple_seq_add_stmt(&seq, incr_cntr);
+
+          /* Store count in the map entry.  */
+          auto store_cntr = gimple_build_assign(unshare_expr(memref), cntr);
+          gimple_seq_add_stmt(&seq, store_cntr);
+
+        } else {
+
+          /* Use a serialized memory model.  */
+          tree memmod = build_int_cst(integer_type_node, MEMMODEL_SEQ_CST);
+
+          tree fadd = builtin_decl_explicit(BUILT_IN_ATOMIC_FETCH_ADD_1);
+          auto incr_cntr = gimple_build_call(fadd, 3, ntry, incrv, memmod);
+          gimple_seq_add_stmt(&seq, incr_cntr);
+
         }
-
-        /* Add the increment (1 or the overflow bit) to count.  */
-        auto incr_cntr = gimple_build_assign(cntr, PLUS_EXPR, cntr, incrv);
-        gimple_seq_add_stmt(&seq, incr_cntr);
-
-        /* Store count in the map entry.  */
-        auto store_cntr = gimple_build_assign(unshare_expr(memref), cntr);
-        gimple_seq_add_stmt(&seq, store_cntr);
 
         /* Store bid >> 1 in __afl_prev_loc.  */
         auto shift_loc =
@@ -368,11 +338,100 @@ struct afl_pass : gimple_opt_pass {
       }
 
       /* Insert the generated sequence.  */
-      gimple_stmt_iterator insp = gsi_after_labels(bb);
-      gsi_insert_seq_before(&insp, seq, GSI_SAME_STMT);
+      if (block_has_returns_twice(bb)) {
 
-      /* Bump this function's instrumented block counter.  */
-      blocks++;
+        /* For blocks with returns_twice calls (setjmp), we must not
+           insert instrumentation before the call. Instead, we create a
+           trampoline block for normal entry and redirect normal edges
+           to it. Abnormal edges (from longjmp) go directly to the
+           original block.  */
+
+        /* Check if this block has any normal (non-abnormal) predecessors.
+           If not, it's only reachable via longjmp and we skip it.
+           See: https://gcc.gnu.org/onlinedocs/gccint/Edges.html  */
+        auto_vec<edge> normal_preds;
+        edge           e;
+        edge_iterator  ei;
+        FOR_EACH_EDGE(e, ei, bb->preds) {
+
+          if (!(e->flags & EDGE_ABNORMAL)) normal_preds.safe_push(e);
+
+        }
+
+        /* Only create trampoline if there are normal predecessors.  */
+        if (!normal_preds.is_empty()) {
+
+          /* GCC caches dominance information for optimization passes.
+             This info becomes invalid when we modify the CFG by
+             splitting blocks and redirecting edges.
+
+             We must free it before CFG modifications, otherwise GCC's
+             internal checks (-fchecking) will fail with errors like:
+             "error: dominator of 9 should be 2, not 3"
+
+             The TODO_update_ssa and TODO_cleanup_cfg flags in
+             todo_flags_finish ensure GCC recomputes what it needs
+             after our pass completes.  */
+          if (dom_info_available_p(CDI_DOMINATORS))
+            free_dominance_info(CDI_DOMINATORS);
+          if (dom_info_available_p(CDI_POST_DOMINATORS))
+            free_dominance_info(CDI_POST_DOMINATORS);
+
+          /* Create trampoline by splitting at the start of the block.
+             split_block_after_labels splits before any statements,
+             creating an empty predecessor block.  */
+          edge split_e = split_block_after_labels(bb);
+
+          /* After split_block_after_labels(bb):
+             - bb becomes empty (the trampoline)
+             - split_e->dest is the new block with original statements
+             - All original predecessors now point to bb (trampoline)  */
+          basic_block trampoline = bb;
+          basic_block original = split_e->dest;
+
+          /* Mark the original block as handled so we don't reprocess it
+             when we encounter it later in the FOR_EACH_BB_FN loop.  */
+          returns_twice_handled.add(original);
+
+          /* Redirect abnormal edges to bypass trampoline.
+             Iterate over a copy since we're modifying edges.  */
+          auto_vec<edge> abnormal_preds;
+          FOR_EACH_EDGE(e, ei, trampoline->preds) {
+
+            if (e->flags & EDGE_ABNORMAL) abnormal_preds.safe_push(e);
+
+          }
+
+          for (unsigned i = 0; i < abnormal_preds.length(); i++) {
+
+            redirect_edge_succ(abnormal_preds[i], original);
+
+          }
+
+          /* Insert instrumentation in trampoline.  */
+          gimple_stmt_iterator insp = gsi_start_bb(trampoline);
+          gsi_insert_seq_before(&insp, seq, GSI_NEW_STMT);
+
+          did_split = true;
+
+          /* Bump this function's instrumented block counter.  */
+          blocks++;
+
+        }
+
+        /* If no normal predecessors, skip instrumentation entirely
+           (block only reachable via longjmp).  */
+
+      } else {
+
+        /* Normal case: insert instrumentation at block start.  */
+        gimple_stmt_iterator insp = gsi_after_labels(bb);
+        gsi_insert_seq_before(&insp, seq, GSI_SAME_STMT);
+
+        /* Bump this function's instrumented block counter.  */
+        blocks++;
+
+      }
 
     }
 
@@ -397,6 +456,9 @@ struct afl_pass : gimple_opt_pass {
       edge e = single_succ_edge(ENTRY_BLOCK_PTR_FOR_FN(fn));
       gsi_insert_seq_on_edge_immediate(e, seq);
 
+      /* If we did any block splitting, also rebuild cgraph edges.  */
+      if (did_split) return TODO_rebuild_cgraph_edges;
+
     }
 
     return 0;
@@ -406,14 +468,53 @@ struct afl_pass : gimple_opt_pass {
   /* Decide whether to instrument block BB.  Skip it due to the random
      distribution, or if it's the single successor of all its
      predecessors.  */
-  inline bool instrument_block_p(basic_block bb) {
+  inline bool instrument_block_p(function *fn, basic_block bb) {
 
-    if (R(100) >= (long int)inst_ratio) return false;
+    if (AFL_R(100) >= (long int)inst_ratio) return false;
+
+/* GCC versions < 15 can ICE in purge_dead_edges during RTL CFG cleanup when
+   side-effecting instrumentation is injected into EH-only dispatcher/resx
+   blocks produced by coroutine lowering. Restrict this workaround to
+   coroutine-related functions. */
+#if GCC_VERSION < 15000
+    if (fn->coroutine_component) {
+
+      for (gimple_stmt_iterator gsi = gsi_start_bb(bb); !gsi_end_p(gsi);
+           gsi_next(&gsi)) {
+
+        gimple           stmt = gsi_stmt(gsi);
+        enum gimple_code code = gimple_code(stmt);
+        if (code == GIMPLE_EH_DISPATCH || code == GIMPLE_RESX) return false;
+
+      }
+
+    }
+
+#endif
 
     edge          e;
     edge_iterator ei;
     FOR_EACH_EDGE(e, ei, bb->preds)
     if (!single_succ_p(e->src)) return true;
+
+    return false;
+
+  }
+
+  /* Check if BB contains a returns_twice call (e.g., setjmp).
+     Returns true if such a call exists anywhere in the block.  */
+  inline bool block_has_returns_twice(basic_block bb) {
+
+    for (gimple_stmt_iterator gsi = gsi_start_bb(bb); !gsi_end_p(gsi);
+         gsi_next(&gsi)) {
+
+      if (gimple_code(gsi_stmt(gsi)) == GIMPLE_CALL) {
+
+        if (gimple_call_flags(gsi_stmt(gsi)) & ECF_RETURNS_TWICE) return true;
+
+      }
+
+    }
 
     return false;
 
@@ -456,6 +557,8 @@ struct afl_pass : gimple_opt_pass {
      thread-local variable.  */
   static inline tree get_afl_area_ptr_decl() {
 
+    /* If type changes, the size N in FETCH_ADD_<N> must be adjusted
+       in builtin calls above.  */
     tree type = build_pointer_type(unsigned_char_type_node);
     tree decl = build_decl(BUILTINS_LOCATION, VAR_DECL,
                            get_identifier("__afl_area_ptr"), type);
@@ -490,421 +593,15 @@ struct afl_pass : gimple_opt_pass {
 
   }
 
-#define report_fatal_error(msg) BADF(msg)
-
-  std::list<std::string> allowListFiles;
-  std::list<std::string> allowListFunctions;
-  std::list<std::string> denyListFiles;
-  std::list<std::string> denyListFunctions;
-
-  /* Note: this ignore check is also called in isInInstrumentList() */
-  bool isIgnoreFunction(function *F) {
-
-    // Starting from "LLVMFuzzer" these are functions used in libfuzzer based
-    // fuzzing campaign installations, e.g. oss-fuzz
-
-    static constexpr const char *ignoreList[] = {
-
-        "asan.",
-        "llvm.",
-        "sancov.",
-        "__ubsan_",
-        "ign.",
-        "__afl_",
-        "_fini",
-        "__libc_csu",
-        "__asan",
-        "__msan",
-        "__cmplog",
-        "__sancov",
-        "msan.",
-        "LLVMFuzzerM",
-        "LLVMFuzzerC",
-        "LLVMFuzzerI",
-        "__decide_deferred",
-        "maybe_duplicate_stderr",
-        "discard_output",
-        "close_stdout",
-        "dup_and_close_stderr",
-        "maybe_close_fd_mask",
-        "ExecuteFilesOnyByOne"
-
-    };
-
-    const char *name = IDENTIFIER_POINTER(DECL_NAME(F->decl));
-    int         len = IDENTIFIER_LENGTH(DECL_NAME(F->decl));
-
-    for (auto const &ignoreListFunc : ignoreList) {
-
-      if (strncmp(name, ignoreListFunc, len) == 0) { return true; }
-
-    }
-
-    return false;
-
-  }
-
-  void initInstrumentList() {
-
-    char *allowlist = getenv("AFL_GCC_ALLOWLIST");
-    if (!allowlist) allowlist = getenv("AFL_GCC_INSTRUMENT_FILE");
-    if (!allowlist) allowlist = getenv("AFL_GCC_WHITELIST");
-    if (!allowlist) allowlist = getenv("AFL_LLVM_ALLOWLIST");
-    if (!allowlist) allowlist = getenv("AFL_LLVM_INSTRUMENT_FILE");
-    if (!allowlist) allowlist = getenv("AFL_LLVM_WHITELIST");
-    char *denylist = getenv("AFL_GCC_DENYLIST");
-    if (!denylist) denylist = getenv("AFL_GCC_BLOCKLIST");
-    if (!denylist) denylist = getenv("AFL_LLVM_DENYLIST");
-    if (!denylist) denylist = getenv("AFL_LLVM_BLOCKLIST");
-
-    if (allowlist && denylist)
-      FATAL(
-          "You can only specify either AFL_GCC_ALLOWLIST or AFL_GCC_DENYLIST "
-          "but not both!");
-
-    if (allowlist) {
-
-      std::string   line;
-      std::ifstream fileStream;
-      fileStream.open(allowlist);
-      if (!fileStream) report_fatal_error("Unable to open AFL_GCC_ALLOWLIST");
-      getline(fileStream, line);
-
-      while (fileStream) {
-
-        int         is_file = -1;
-        std::size_t npos;
-        std::string original_line = line;
-
-        line.erase(std::remove_if(line.begin(), line.end(), ::isspace),
-                   line.end());
-
-        // remove # and following
-        if ((npos = line.find("#")) != std::string::npos)
-          line = line.substr(0, npos);
-
-        if (line.compare(0, 4, "fun:") == 0) {
-
-          is_file = 0;
-          line = line.substr(4);
-
-        } else if (line.compare(0, 9, "function:") == 0) {
-
-          is_file = 0;
-          line = line.substr(9);
-
-        } else if (line.compare(0, 4, "src:") == 0) {
-
-          is_file = 1;
-          line = line.substr(4);
-
-        } else if (line.compare(0, 7, "source:") == 0) {
-
-          is_file = 1;
-          line = line.substr(7);
-
-        }
-
-        if (line.find(":") != std::string::npos) {
-
-          FATAL("invalid line in AFL_GCC_ALLOWLIST: %s", original_line.c_str());
-
-        }
-
-        if (line.length() > 0) {
-
-          // if the entry contains / or . it must be a file
-          if (is_file == -1)
-            if (line.find("/") != std::string::npos ||
-                line.find(".") != std::string::npos)
-              is_file = 1;
-          // otherwise it is a function
-
-          if (is_file == 1)
-            allowListFiles.push_back(line);
-          else
-            allowListFunctions.push_back(line);
-
-        }
-
-        getline(fileStream, line);
-
-      }
-
-      if (debug)
-        DEBUGF("loaded allowlist with %zu file and %zu function entries\n",
-               allowListFiles.size(), allowListFunctions.size());
-
-    }
-
-    if (denylist) {
-
-      std::string   line;
-      std::ifstream fileStream;
-      fileStream.open(denylist);
-      if (!fileStream) report_fatal_error("Unable to open AFL_GCC_DENYLIST");
-      getline(fileStream, line);
-
-      while (fileStream) {
-
-        int         is_file = -1;
-        std::size_t npos;
-        std::string original_line = line;
-
-        line.erase(std::remove_if(line.begin(), line.end(), ::isspace),
-                   line.end());
-
-        // remove # and following
-        if ((npos = line.find("#")) != std::string::npos)
-          line = line.substr(0, npos);
-
-        if (line.compare(0, 4, "fun:") == 0) {
-
-          is_file = 0;
-          line = line.substr(4);
-
-        } else if (line.compare(0, 9, "function:") == 0) {
-
-          is_file = 0;
-          line = line.substr(9);
-
-        } else if (line.compare(0, 4, "src:") == 0) {
-
-          is_file = 1;
-          line = line.substr(4);
-
-        } else if (line.compare(0, 7, "source:") == 0) {
-
-          is_file = 1;
-          line = line.substr(7);
-
-        }
-
-        if (line.find(":") != std::string::npos) {
-
-          FATAL("invalid line in AFL_GCC_DENYLIST: %s", original_line.c_str());
-
-        }
-
-        if (line.length() > 0) {
-
-          // if the entry contains / or . it must be a file
-          if (is_file == -1)
-            if (line.find("/") != std::string::npos ||
-                line.find(".") != std::string::npos)
-              is_file = 1;
-          // otherwise it is a function
-
-          if (is_file == 1)
-            denyListFiles.push_back(line);
-          else
-            denyListFunctions.push_back(line);
-
-        }
-
-        getline(fileStream, line);
-
-      }
-
-      if (debug)
-        DEBUGF("loaded denylist with %zu file and %zu function entries\n",
-               denyListFiles.size(), denyListFunctions.size());
-
-    }
-
-  }
-
-  std::string getSourceName(function *F) {
-
-    return DECL_SOURCE_FILE(F->decl);
-
-  }
-
-  bool isInInstrumentList(function *F) {
-
-    bool return_default = true;
-
-    // is this a function with code? If it is external we don't instrument it
-    // anyway and it can't be in the instrument file list. Or if it is it is
-    // ignored.
-    if (isIgnoreFunction(F)) return false;
-
-    if (!denyListFiles.empty() || !denyListFunctions.empty()) {
-
-      if (!denyListFunctions.empty()) {
-
-        std::string instFunction = IDENTIFIER_POINTER(DECL_NAME(F->decl));
-
-        for (std::list<std::string>::iterator it = denyListFunctions.begin();
-             it != denyListFunctions.end(); ++it) {
-
-          /* We don't check for filename equality here because
-           * filenames might actually be full paths. Instead we
-           * check that the actual filename ends in the filename
-           * specified in the list. We also allow UNIX-style pattern
-           * matching */
-
-          if (instFunction.length() >= it->length()) {
-
-            if (fnmatch(("*" + *it).c_str(), instFunction.c_str(), 0) == 0) {
-
-              if (debug)
-                DEBUGF(
-                    "Function %s is in the deny function list, not "
-                    "instrumenting ... \n",
-                    instFunction.c_str());
-              return false;
-
-            }
-
-          }
-
-        }
-
-      }
-
-      if (!denyListFiles.empty()) {
-
-        std::string source_file = getSourceName(F);
-
-        if (!source_file.empty()) {
-
-          for (std::list<std::string>::iterator it = denyListFiles.begin();
-               it != denyListFiles.end(); ++it) {
-
-            /* We don't check for filename equality here because
-             * filenames might actually be full paths. Instead we
-             * check that the actual filename ends in the filename
-             * specified in the list. We also allow UNIX-style pattern
-             * matching */
-
-            if (source_file.length() >= it->length()) {
-
-              if (fnmatch(("*" + *it).c_str(), source_file.c_str(), 0) == 0) {
-
-                return false;
-
-              }
-
-            }
-
-          }
-
-        } else {
-
-          // we could not find out the location. in this case we say it is not
-          // in the instrument file list
-          if (!be_quiet)
-            WARNF(
-                "No debug information found for function %s, will be "
-                "instrumented (recompile with -g -O[1-3]).",
-                IDENTIFIER_POINTER(DECL_NAME(F->decl)));
-
-        }
-
-      }
-
-    }
-
-    // if we do not have a instrument file list return true
-    if (!allowListFiles.empty() || !allowListFunctions.empty()) {
-
-      return_default = false;
-
-      if (!allowListFunctions.empty()) {
-
-        std::string instFunction = IDENTIFIER_POINTER(DECL_NAME(F->decl));
-
-        for (std::list<std::string>::iterator it = allowListFunctions.begin();
-             it != allowListFunctions.end(); ++it) {
-
-          /* We don't check for filename equality here because
-           * filenames might actually be full paths. Instead we
-           * check that the actual filename ends in the filename
-           * specified in the list. We also allow UNIX-style pattern
-           * matching */
-
-          if (instFunction.length() >= it->length()) {
-
-            if (fnmatch(("*" + *it).c_str(), instFunction.c_str(), 0) == 0) {
-
-              if (debug)
-                DEBUGF(
-                    "Function %s is in the allow function list, instrumenting "
-                    "... \n",
-                    instFunction.c_str());
-              return true;
-
-            }
-
-          }
-
-        }
-
-      }
-
-      if (!allowListFiles.empty()) {
-
-        std::string source_file = getSourceName(F);
-
-        if (!source_file.empty()) {
-
-          for (std::list<std::string>::iterator it = allowListFiles.begin();
-               it != allowListFiles.end(); ++it) {
-
-            /* We don't check for filename equality here because
-             * filenames might actually be full paths. Instead we
-             * check that the actual filename ends in the filename
-             * specified in the list. We also allow UNIX-style pattern
-             * matching */
-
-            if (source_file.length() >= it->length()) {
-
-              if (fnmatch(("*" + *it).c_str(), source_file.c_str(), 0) == 0) {
-
-                if (debug)
-                  DEBUGF(
-                      "Function %s is in the allowlist (%s), instrumenting ... "
-                      "\n",
-                      IDENTIFIER_POINTER(DECL_NAME(F->decl)),
-                      source_file.c_str());
-                return true;
-
-              }
-
-            }
-
-          }
-
-        } else {
-
-          // we could not find out the location. In this case we say it is not
-          // in the instrument file list
-          if (!be_quiet)
-            WARNF(
-                "No debug information found for function %s, will not be "
-                "instrumented (recompile with -g -O[1-3]).",
-                IDENTIFIER_POINTER(DECL_NAME(F->decl)));
-          return false;
-
-        }
-
-      }
-
-    }
-
-    return return_default;
-
-  }
-
 };
 
 static struct plugin_info afl_plugin = {
 
-    .version = "20200907",
+    .version = "20220420",
     .help = G_("AFL gcc plugin\n\
 \n\
 Set AFL_QUIET in the environment to silence it.\n\
+Set AFL_GCC_ONLY_FSRV in the environment to disable instrumentation.\n\
 \n\
 Set AFL_INST_RATIO in the environment to a number from 0 to 100\n\
 to control how likely a block will be chosen for instrumentation.\n\
@@ -918,20 +615,30 @@ Specify -frandom-seed for reproducible instrumentation.\n\
 
 /* This is the function GCC calls when loading a plugin.  Initialize
    and register further callbacks.  */
-int plugin_init(struct plugin_name_args *  info,
+int plugin_init(struct plugin_name_args   *info,
                 struct plugin_gcc_version *version) {
 
-  if (!plugin_default_version_check(version, &gcc_version))
+  if (!plugin_default_version_check(version, &gcc_version) &&
+      !getenv("AFL_GCC_DISABLE_VERSION_CHECK"))
     FATAL(G_("GCC and plugin have incompatible versions, expected GCC %s, "
              "is %s"),
           gcc_version.basever, version->basever);
 
   /* Show a banner.  */
   bool quiet = false;
-  if (isatty(2) && !getenv("AFL_QUIET"))
+  if (isatty(2) && !getenv("AFL_QUIET")) {
+
     SAYF(cCYA "afl-gcc-pass " cBRI VERSION cRST " by <oliva@adacore.com>\n");
-  else
+    SAYF(cRED
+         "Warning: gcc plugins are currently unmaintained and have known "
+         "issues. Help maintaining by submitting PRs or sponsoring a "
+         "maintainer.\n");
+
+  } else {
+
     quiet = true;
+
+  }
 
   /* Decide instrumentation ratio.  */
   unsigned int inst_ratio = 100U;
@@ -944,11 +651,13 @@ int plugin_init(struct plugin_name_args *  info,
      case it was specified in the command line's -frandom-seed for
      reproducible instrumentation.  */
   srandom(get_random_seed(false));
+  bool fsrv_only =
+      !!getenv("AFL_GCC_ONLY_FSRV") || !!getenv("AFL_GCC_ONLY_FRSV");
 
   const char *name = info->base_name;
-  register_callback(name, PLUGIN_INFO, NULL, &afl_plugin);
+  if (!fsrv_only) { register_callback(name, PLUGIN_INFO, NULL, &afl_plugin); }
 
-  afl_pass *                aflp = new afl_pass(quiet, inst_ratio);
+  afl_pass                 *aflp = new afl_pass(quiet, inst_ratio);
   struct register_pass_info pass_info = {
 
       .pass = aflp,
@@ -958,14 +667,20 @@ int plugin_init(struct plugin_name_args *  info,
 
   };
 
-  register_callback(name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
-  register_callback(name, PLUGIN_FINISH, afl_pass::plugin_finalize,
-                    pass_info.pass);
+  if (!fsrv_only) {
+
+    register_callback(name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
+    register_callback(name, PLUGIN_FINISH, afl_pass::plugin_finalize,
+                      pass_info.pass);
+
+  }
 
   if (!quiet)
     ACTF(G_("%s instrumentation at ratio of %u%% in %s mode."),
          aflp->out_of_line ? G_("Call-based") : G_("Inline"), inst_ratio,
          getenv("AFL_HARDEN") ? G_("hardened") : G_("non-hardened"));
+  else if (fsrv_only)
+    ACTF("Instrumentation disabled due to AFL_GCC_ONLY_FSRV");
 
   return 0;
 

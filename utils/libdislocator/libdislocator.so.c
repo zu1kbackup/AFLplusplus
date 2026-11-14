@@ -6,7 +6,7 @@
    Originally written by Michal Zalewski
 
    Copyright 2016 Google Inc. All rights reserved.
-   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -28,9 +28,12 @@
 #include <limits.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #ifdef __APPLE__
   #include <mach/vm_statistics.h>
+  /* fishhook is used and it is from https://github.com/facebook/fishhook */
+  #include "../macos_fishhook/fishhook.h"
 #endif
 
 #ifdef __FreeBSD__
@@ -39,6 +42,7 @@
 
 #if (defined(__linux__) && !defined(__ANDROID__)) || defined(__HAIKU__)
   #include <unistd.h>
+  #include <sys/prctl.h>
   #ifdef __linux__
     #include <sys/syscall.h>
     #include <malloc.h>
@@ -66,6 +70,10 @@
       } while (0)
 
   #endif
+  #ifndef PR_SET_VMA
+    #define PR_SET_VMA 0x53564d41
+    #define PR_SET_VMA_ANON_NAME 0
+  #endif
 #endif
 
 #include "config.h"
@@ -85,9 +93,11 @@ typedef struct {
 
 #define ALLOC_ALIGN_SIZE (_Alignof(max_align_t))
 
-#ifndef PAGE_SIZE
-  #define PAGE_SIZE 4096
-#endif                                                        /* !PAGE_SIZE */
+#ifdef PAGE_SIZE
+  #undef PAGE_SIZE
+#endif
+static size_t cached_page_size = 4096;
+#define PAGE_SIZE cached_page_size
 
 #ifndef MAP_ANONYMOUS
   #define MAP_ANONYMOUS MAP_ANON
@@ -157,7 +167,14 @@ static u8     alloc_verbose,            /* Additional debug messages        */
 static _Atomic size_t total_mem;        /* Currently allocated mem          */
 
 static __thread u32 call_depth;         /* To avoid recursion via fprintf() */
-static u32          alloc_canary;
+static u32          alloc_canary = ALLOC_CANARY;
+
+#ifdef __APPLE__
+static void *(*__libc_malloc)(size_t);
+static void *(*__libc_calloc)(size_t, size_t);
+static void *(*__libc_realloc)(void *, size_t);
+static void (*__libc_free)(void *);
+#endif
 
 /* This is the main alloc function. It allocates one page more than necessary,
    sets that tailing page to PROT_NONE, and then increments the return address
@@ -166,7 +183,7 @@ static u32          alloc_canary;
 
 static void *__dislocator_alloc(size_t len) {
 
-  u8 *   ret, *base;
+  u8    *ret, *base;
   size_t tlen;
   int    flags, protflags, fd, sp;
 
@@ -251,6 +268,20 @@ static void *__dislocator_alloc(size_t len) {
 
   }
 
+#if defined(USENAMEDPAGE)
+  #if defined(__linux__)
+  // in the /proc/<pid>/maps file, the anonymous page appears as
+  // `<start>-<end> ---p 00000000 00:00 0 [anon:libdislocator]`
+  if (prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, (unsigned long)ret, tlen,
+            (unsigned long)"libdislocator") < 0) {
+
+    DEBUGF("prctl() failed");
+
+  }
+
+  #endif
+#endif
+
   /* Set PROT_NONE on the last page. */
 
   if (mprotect(ret + PG_COUNT(rlen + 8) * PAGE_SIZE, PAGE_SIZE, PROT_NONE))
@@ -285,7 +316,8 @@ static void *__dislocator_alloc(size_t len) {
 /* The "user-facing" wrapper for calloc(). This just checks for overflows and
    displays debug messages if requested. */
 
-void *calloc(size_t elem_len, size_t elem_cnt) {
+__attribute__((malloc)) __attribute__((alloc_size(1, 2))) void *calloc(
+    size_t elem_len, size_t elem_cnt) {
 
   void *ret;
 
@@ -320,7 +352,8 @@ void *calloc(size_t elem_len, size_t elem_cnt) {
    memory (unlike calloc(), malloc() is not guaranteed to return zeroed
    memory). */
 
-void *malloc(size_t len) {
+__attribute__((malloc)) __attribute__((alloc_size(1))) void *malloc(
+    size_t len) {
 
   void *ret;
 
@@ -379,7 +412,7 @@ void free(void *ptr) {
 /* Realloc is pretty straightforward, too. We forcibly reallocate the buffer,
    move data, and then free (aka mprotect()) the original one. */
 
-void *realloc(void *ptr, size_t len) {
+__attribute__((alloc_size(2))) void *realloc(void *ptr, size_t len) {
 
   void *ret;
 
@@ -431,7 +464,8 @@ int posix_memalign(void **ptr, size_t align, size_t len) {
 
 /* just the non-posix fashion */
 
-void *memalign(size_t align, size_t len) {
+__attribute__((malloc)) __attribute__((alloc_size(2))) void *memalign(
+    size_t align, size_t len) {
 
   void *ret = NULL;
 
@@ -447,7 +481,8 @@ void *memalign(size_t align, size_t len) {
 
 /* sort of C11 alias of memalign only more severe, alignment-wise */
 
-void *aligned_alloc(size_t align, size_t len) {
+__attribute__((malloc)) __attribute__((alloc_size(2))) void *aligned_alloc(
+    size_t align, size_t len) {
 
   void *ret = NULL;
 
@@ -465,11 +500,12 @@ void *aligned_alloc(size_t align, size_t len) {
 
 /* specific BSD api mainly checking possible overflow for the size */
 
-void *reallocarray(void *ptr, size_t elem_len, size_t elem_cnt) {
+__attribute__((alloc_size(2, 3))) void *reallocarray(void *ptr, size_t elem_len,
+                                                     size_t elem_cnt) {
 
   const size_t elem_lim = 1UL << (sizeof(size_t) * 4);
   const size_t elem_tot = elem_len * elem_cnt;
-  void *       ret = NULL;
+  void        *ret = NULL;
 
   if ((elem_len >= elem_lim || elem_cnt >= elem_lim) && elem_len > 0 &&
       elem_cnt > (SIZE_MAX / elem_len)) {
@@ -486,7 +522,28 @@ void *reallocarray(void *ptr, size_t elem_len, size_t elem_cnt) {
 
 }
 
-#if !defined(__ANDROID__)
+int reallocarr(void *ptr, size_t elem_len, size_t elem_cnt) {
+
+  void        *ret = NULL;
+  const size_t elem_tot = elem_len * elem_cnt;
+
+  if (elem_tot == 0) {
+
+    void **h = &ptr;
+    *h = ret;
+    return 0;
+
+  }
+
+  ret = reallocarray(ptr, elem_len, elem_cnt);
+  return ret ? 0 : -1;
+
+}
+
+#if defined(__APPLE__)
+size_t malloc_size(const void *ptr) {
+
+#elif !defined(__ANDROID__)
 size_t malloc_usable_size(void *ptr) {
 
 #else
@@ -498,13 +555,25 @@ size_t malloc_usable_size(const void *ptr) {
 
 }
 
+#if defined(__APPLE__)
+size_t malloc_good_size(size_t len) {
+
+  return (len & ~(ALLOC_ALIGN_SIZE - 1)) + ALLOC_ALIGN_SIZE;
+
+}
+
+#endif
+
 __attribute__((constructor)) void __dislocator_init(void) {
+
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size > 0) cached_page_size = (size_t)page_size;
 
   char *tmp = getenv("AFL_LD_LIMIT_MB");
 
   if (tmp) {
 
-    char *             tok;
+    char              *tok;
     unsigned long long mmem = strtoull(tmp, &tok, 10);
     if (*tok != '\0' || errno == ERANGE || mmem > SIZE_MAX / 1024 / 1024)
       FATAL("Bad value for AFL_LD_LIMIT_MB");
@@ -521,6 +590,26 @@ __attribute__((constructor)) void __dislocator_init(void) {
   hard_fail = !!getenv("AFL_LD_HARD_FAIL");
   no_calloc_over = !!getenv("AFL_LD_NO_CALLOC_OVER");
   align_allocations = !!getenv("AFL_ALIGNED_ALLOC");
+
+#ifdef __APPLE__
+  rebind_symbols(
+      (struct rebinding[]){
+
+          {"malloc", malloc, (void **)&__libc_malloc},
+          {"calloc", calloc, (void **)&__libc_calloc},
+          {"realloc", realloc, (void **)&__libc_realloc},
+          {"free", free, (void **)&__libc_free},
+
+      },
+
+      4);
+#endif
+
+}
+
+__attribute__((destructor)) void __dislocator_fini(void) {
+
+  alloc_canary = ALLOC_CANARY;  // restore to default canary value
 
 }
 

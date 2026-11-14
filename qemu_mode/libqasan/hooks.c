@@ -1,5 +1,5 @@
 /*******************************************************************************
-Copyright (c) 2019-2020, Andrea Fioraldi
+Copyright (c) 2019-2024, Andrea Fioraldi
 
 
 Redistribution and use in source and binary forms, with or without
@@ -27,6 +27,13 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "map_macro.h"
 #include <unistd.h>
 #include <sys/syscall.h>
+
+/* Newer glibc <string.h> exposes these as type-generic _Generic macros for
+   const-correctness, which collides with our function definitions below. */
+#undef memchr
+#undef strchr
+#undef strrchr
+#undef strstr
 
 char *(*__lq_libc_fgets)(char *, int, FILE *);
 int (*__lq_libc_atoi)(const char *);
@@ -202,7 +209,7 @@ char *fgets(char *s, int size, FILE *stream) {
 
   QASAN_DEBUG("%14p: fgets(%p, %d, %p)\n", rtv, s, size, stream);
   QASAN_STORE(s, size);
-#ifndef __ANDROID__
+#if defined(QASAN_HAVE_COMPLETE_FILE) && !defined(__ANDROID__)
   QASAN_LOAD(stream, sizeof(FILE));
 #endif
   char *r = __lq_libc_fgets(s, size, stream);

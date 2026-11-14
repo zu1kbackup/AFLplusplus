@@ -1,10 +1,11 @@
 #include "frida-gumjs.h"
 
 #include "config.h"
-#include "debug.h"
 
+#include "frida_cmplog.h"
 #include "instrument.h"
 #include "persistent.h"
+#include "util.h"
 
 #if defined(__i386__)
 
@@ -16,8 +17,7 @@ typedef struct {
 } persistent_ctx_t;
 
 static persistent_ctx_t saved_regs = {0};
-
-static gpointer saved_ret = NULL;
+static gpointer         persistent_loop = NULL;
 
 gboolean persistent_is_supported(void) {
 
@@ -25,113 +25,112 @@ gboolean persistent_is_supported(void) {
 
 }
 
-static void instrument_persitent_save_regs(GumX86Writer *    cw,
+static void instrument_persitent_save_regs(GumX86Writer     *cw,
                                            persistent_ctx_t *regs) {
 
   GumAddress regs_address = GUM_ADDRESS(regs);
 
   /* Should be pushing FPU here, but meh */
   gum_x86_writer_put_pushfx(cw);
-  gum_x86_writer_put_push_reg(cw, GUM_REG_EAX);
+  gum_x86_writer_put_push_reg(cw, GUM_X86_EAX);
 
-  gum_x86_writer_put_mov_reg_address(cw, GUM_REG_EAX, regs_address);
+  gum_x86_writer_put_mov_reg_address(cw, GUM_X86_EAX, regs_address);
 
   gum_x86_writer_put_mov_reg_offset_ptr_reg(
-      cw, GUM_REG_EAX, offsetof(GumCpuContext, ebx), GUM_REG_EBX);
+      cw, GUM_X86_EAX, offsetof(GumCpuContext, ebx), GUM_X86_EBX);
   gum_x86_writer_put_mov_reg_offset_ptr_reg(
-      cw, GUM_REG_EAX, offsetof(GumCpuContext, ecx), GUM_REG_ECX);
+      cw, GUM_X86_EAX, offsetof(GumCpuContext, ecx), GUM_X86_ECX);
   gum_x86_writer_put_mov_reg_offset_ptr_reg(
-      cw, GUM_REG_EAX, offsetof(GumCpuContext, edx), GUM_REG_EDX);
+      cw, GUM_X86_EAX, offsetof(GumCpuContext, edx), GUM_X86_EDX);
   gum_x86_writer_put_mov_reg_offset_ptr_reg(
-      cw, GUM_REG_EAX, offsetof(GumCpuContext, edi), GUM_REG_EDI);
+      cw, GUM_X86_EAX, offsetof(GumCpuContext, edi), GUM_X86_EDI);
   gum_x86_writer_put_mov_reg_offset_ptr_reg(
-      cw, GUM_REG_EAX, offsetof(GumCpuContext, esi), GUM_REG_ESI);
+      cw, GUM_X86_EAX, offsetof(GumCpuContext, esi), GUM_X86_ESI);
   gum_x86_writer_put_mov_reg_offset_ptr_reg(
-      cw, GUM_REG_EAX, offsetof(GumCpuContext, ebp), GUM_REG_EBP);
+      cw, GUM_X86_EAX, offsetof(GumCpuContext, ebp), GUM_X86_EBP);
 
   /* Store RIP */
-  gum_x86_writer_put_mov_reg_address(cw, GUM_REG_EBX,
+  gum_x86_writer_put_mov_reg_address(cw, GUM_X86_EBX,
                                      GUM_ADDRESS(persistent_start));
 
   gum_x86_writer_put_mov_reg_offset_ptr_reg(
-      cw, GUM_REG_EAX, offsetof(GumCpuContext, eip), GUM_REG_EBX);
+      cw, GUM_X86_EAX, offsetof(GumCpuContext, eip), GUM_X86_EBX);
 
   /* Store adjusted RSP */
-  gum_x86_writer_put_mov_reg_reg(cw, GUM_REG_EBX, GUM_REG_ESP);
+  gum_x86_writer_put_mov_reg_reg(cw, GUM_X86_EBX, GUM_X86_ESP);
 
   /* RED_ZONE + Saved flags, RAX */
-  gum_x86_writer_put_add_reg_imm(cw, GUM_REG_EBX, (0x4 * 2));
+  gum_x86_writer_put_add_reg_imm(cw, GUM_X86_EBX, (0x4 * 2));
   gum_x86_writer_put_mov_reg_offset_ptr_reg(
-      cw, GUM_REG_EAX, offsetof(GumCpuContext, esp), GUM_REG_EBX);
+      cw, GUM_X86_EAX, offsetof(GumCpuContext, esp), GUM_X86_EBX);
 
   /* Save the flags */
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_EBX, GUM_REG_ESP, 0x4);
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_EBX, GUM_X86_ESP, 0x4);
   gum_x86_writer_put_mov_reg_offset_ptr_reg(
-      cw, GUM_REG_EAX, offsetof(persistent_ctx_t, eflags), GUM_REG_EBX);
+      cw, GUM_X86_EAX, offsetof(persistent_ctx_t, eflags), GUM_X86_EBX);
 
   /* Save the RAX */
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_EBX, GUM_REG_ESP, 0x0);
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_EBX, GUM_X86_ESP, 0x0);
   gum_x86_writer_put_mov_reg_offset_ptr_reg(
-      cw, GUM_REG_EAX, offsetof(GumCpuContext, eax), GUM_REG_EBX);
+      cw, GUM_X86_EAX, offsetof(GumCpuContext, eax), GUM_X86_EBX);
 
   /* Pop the saved values */
-  gum_x86_writer_put_lea_reg_reg_offset(cw, GUM_REG_ESP, GUM_REG_ESP, 0x8);
+  gum_x86_writer_put_lea_reg_reg_offset(cw, GUM_X86_ESP, GUM_X86_ESP, 0x8);
 
 }
 
-static void instrument_persitent_restore_regs(GumX86Writer *    cw,
+static void instrument_persitent_restore_regs(GumX86Writer     *cw,
                                               persistent_ctx_t *regs) {
 
   GumAddress regs_address = GUM_ADDRESS(regs);
-  gum_x86_writer_put_mov_reg_address(cw, GUM_REG_EAX, regs_address);
+  gum_x86_writer_put_mov_reg_address(cw, GUM_X86_EAX, regs_address);
 
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_ECX, GUM_REG_EAX,
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_ECX, GUM_X86_EAX,
                                             offsetof(GumCpuContext, ecx));
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_EDX, GUM_REG_EAX,
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_EDX, GUM_X86_EAX,
                                             offsetof(GumCpuContext, edx));
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_EDI, GUM_REG_EAX,
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_EDI, GUM_X86_EAX,
                                             offsetof(GumCpuContext, edi));
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_ESI, GUM_REG_EAX,
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_ESI, GUM_X86_EAX,
                                             offsetof(GumCpuContext, esi));
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_EBP, GUM_REG_EAX,
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_EBP, GUM_X86_EAX,
                                             offsetof(GumCpuContext, ebp));
 
   /* Don't restore RIP */
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_ESP, GUM_REG_EAX,
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_ESP, GUM_X86_EAX,
                                             offsetof(GumCpuContext, esp));
 
   /* Restore RBX, RAX & Flags */
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_EBX, GUM_REG_EAX,
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_EBX, GUM_X86_EAX,
                                             offsetof(GumCpuContext, ebx));
-  gum_x86_writer_put_push_reg(cw, GUM_REG_EBX);
+  gum_x86_writer_put_push_reg(cw, GUM_X86_EBX);
 
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_EBX, GUM_REG_EAX,
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_EBX, GUM_X86_EAX,
                                             offsetof(GumCpuContext, eax));
-  gum_x86_writer_put_push_reg(cw, GUM_REG_EBX);
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_EBX, GUM_REG_EAX,
+  gum_x86_writer_put_push_reg(cw, GUM_X86_EBX);
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_EBX, GUM_X86_EAX,
                                             offsetof(persistent_ctx_t, eflags));
-  gum_x86_writer_put_push_reg(cw, GUM_REG_EBX);
+  gum_x86_writer_put_push_reg(cw, GUM_X86_EBX);
 
   gum_x86_writer_put_popfx(cw);
-  gum_x86_writer_put_pop_reg(cw, GUM_REG_EAX);
-  gum_x86_writer_put_pop_reg(cw, GUM_REG_EBX);
+  gum_x86_writer_put_pop_reg(cw, GUM_X86_EAX);
+  gum_x86_writer_put_pop_reg(cw, GUM_X86_EBX);
 
 }
 
-static void instrument_exit(GumX86Writer *cw) {
+static void instrument_afl_persistent_loop_func(void) {
 
-  gum_x86_writer_put_mov_reg_address(cw, GUM_REG_EAX, GUM_ADDRESS(_exit));
-  gum_x86_writer_put_mov_reg_u32(cw, GUM_REG_EDI, 0);
-  gum_x86_writer_put_push_reg(cw, GUM_REG_EDI);
-  gum_x86_writer_put_call_reg(cw, GUM_REG_EAX);
+  if (__afl_persistent_loop(persistent_count) == 0) { _exit(0); };
 
-}
+  if (instrument_previous_pc_addr == NULL) {
 
-static int instrument_afl_persistent_loop_func(void) {
+    FATAL("instrument_previous_pc_addr uninitialized");
 
-  int ret = __afl_persistent_loop(persistent_count);
-  instrument_previous_pc = instrument_hash_zero;
-  return ret;
+  }
+
+  *instrument_previous_pc_addr = instrument_hash_zero;
+
+  cmplog_reset();
 
 }
 
@@ -139,7 +138,6 @@ static void instrument_afl_persistent_loop(GumX86Writer *cw) {
 
   gum_x86_writer_put_call_address_with_arguments(
       cw, GUM_CALL_CAPI, GUM_ADDRESS(instrument_afl_persistent_loop_func), 0);
-  gum_x86_writer_put_test_reg_reg(cw, GUM_REG_EAX, GUM_REG_EAX);
 
 }
 
@@ -147,20 +145,20 @@ static void persistent_prologue_hook(GumX86Writer *cw, persistent_ctx_t *regs) {
 
   if (persistent_hook == NULL) return;
 
-  gum_x86_writer_put_mov_reg_address(cw, GUM_REG_ECX,
+  gum_x86_writer_put_mov_reg_address(cw, GUM_X86_ECX,
                                      GUM_ADDRESS(&__afl_fuzz_len));
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_ECX, GUM_REG_ECX, 0);
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_ECX, GUM_REG_ECX, 0);
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_ECX, GUM_X86_ECX, 0);
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_ECX, GUM_X86_ECX, 0);
 
-  gum_x86_writer_put_mov_reg_address(cw, GUM_REG_EDX,
+  gum_x86_writer_put_mov_reg_address(cw, GUM_X86_EDX,
                                      GUM_ADDRESS(&__afl_fuzz_ptr));
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_EDX, GUM_REG_EDX, 0);
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_EDX, GUM_X86_EDX, 0);
 
   /* Base address is 64-bits (hence two zero arguments) */
   gum_x86_writer_put_call_address_with_arguments(
       cw, GUM_CALL_CAPI, GUM_ADDRESS(persistent_hook), 3, GUM_ARG_ADDRESS,
-      GUM_ADDRESS(&regs->ctx), GUM_ARG_REGISTER, GUM_REG_EDX, GUM_ARG_REGISTER,
-      GUM_REG_ECX);
+      GUM_ADDRESS(&regs->ctx), GUM_ARG_REGISTER, GUM_X86_EDX, GUM_ARG_REGISTER,
+      GUM_X86_ECX);
 
 }
 
@@ -170,16 +168,17 @@ static void instrument_persitent_save_ret(GumX86Writer *cw) {
   gssize offset = (3 * 4);
 
   gum_x86_writer_put_pushfx(cw);
-  gum_x86_writer_put_push_reg(cw, GUM_REG_EAX);
-  gum_x86_writer_put_push_reg(cw, GUM_REG_EBX);
+  gum_x86_writer_put_push_reg(cw, GUM_X86_EAX);
+  gum_x86_writer_put_push_reg(cw, GUM_X86_EBX);
 
-  gum_x86_writer_put_mov_reg_address(cw, GUM_REG_EAX, GUM_ADDRESS(&saved_ret));
-  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_REG_EBX, GUM_REG_ESP,
+  gum_x86_writer_put_mov_reg_address(cw, GUM_X86_EAX,
+                                     GUM_ADDRESS(&persistent_ret));
+  gum_x86_writer_put_mov_reg_reg_offset_ptr(cw, GUM_X86_EBX, GUM_X86_ESP,
                                             offset);
-  gum_x86_writer_put_mov_reg_ptr_reg(cw, GUM_REG_EAX, GUM_REG_EBX);
+  gum_x86_writer_put_mov_reg_ptr_reg(cw, GUM_X86_EAX, GUM_X86_EBX);
 
-  gum_x86_writer_put_pop_reg(cw, GUM_REG_EBX);
-  gum_x86_writer_put_pop_reg(cw, GUM_REG_EAX);
+  gum_x86_writer_put_pop_reg(cw, GUM_X86_EBX);
+  gum_x86_writer_put_pop_reg(cw, GUM_X86_EAX);
   gum_x86_writer_put_popfx(cw);
 
 }
@@ -187,67 +186,43 @@ static void instrument_persitent_save_ret(GumX86Writer *cw) {
 void persistent_prologue_arch(GumStalkerOutput *output) {
 
   /*
+   *  SAVE RET (Used to write the epilogue if persistent_ret is not set)
    *  SAVE REGS
-   *  SAVE RET
-   *  POP RET
-   * loop:
+   * loop: (Save address of where the eiplogue should jump back to)
    *  CALL instrument_afl_persistent_loop
-   *  TEST EAX, EAX
-   *  JZ end:
-   *  call hook (optionally)
+   *  CALL hook (optionally)
    *  RESTORE REGS
-   *  call original
-   *  jmp loop:
-   *
-   * end:
-   *  JMP SAVED RET
-   *
-   * original:
    *  INSTRUMENTED PERSISTENT FUNC
    */
 
   GumX86Writer *cw = output->writer.x86;
 
-  gconstpointer loop = cw->code + 1;
+  FVERBOSE("Persistent loop reached");
 
-  OKF("Persistent loop reached");
+  /*
+   * If we haven't set persistent_ret, then assume that we are dealing with a
+   * function and we should loop when that function returns.
+   */
+  if (persistent_ret == 0) { instrument_persitent_save_ret(cw); }
 
-  /* Pop the return value */
-  gum_x86_writer_put_lea_reg_reg_offset(cw, GUM_REG_ESP, GUM_REG_ESP, 4);
-
+  /* Save the current context */
   instrument_persitent_save_regs(cw, &saved_regs);
 
-  /* loop: */
-  gum_x86_writer_put_label(cw, loop);
+  /* Store a pointer to where we should return for our next iteration */
+  persistent_loop = gum_x86_writer_cur(cw);
 
-  /* call instrument_prologue_func */
+  /* call __afl_persistent_loop and _exit if zero. Also reset our previous_pc */
   instrument_afl_persistent_loop(cw);
-
-  /* jz done */
-  gconstpointer done = cw->code + 1;
-  gum_x86_writer_put_jcc_near_label(cw, X86_INS_JE, done, GUM_UNLIKELY);
 
   /* Optionally call the persistent hook */
   persistent_prologue_hook(cw, &saved_regs);
 
+  /* Restore our CPU context before we continue execution */
   instrument_persitent_restore_regs(cw, &saved_regs);
-  gconstpointer original = cw->code + 1;
-  /* call original */
-  gum_x86_writer_put_call_near_label(cw, original);
-  /* jmp loop */
-  gum_x86_writer_put_jmp_near_label(cw, loop);
-
-  /* done: */
-  gum_x86_writer_put_label(cw, done);
-
-  instrument_exit(cw);
-
-  /* original: */
-  gum_x86_writer_put_label(cw, original);
-
-  instrument_persitent_save_ret(cw);
 
   if (persistent_debug) { gum_x86_writer_put_breakpoint(cw); }
+
+  /* The original instrumented code is emitted here. */
 
 }
 
@@ -257,8 +232,13 @@ void persistent_epilogue_arch(GumStalkerOutput *output) {
 
   if (persistent_debug) { gum_x86_writer_put_breakpoint(cw); }
 
-  gum_x86_writer_put_mov_reg_address(cw, GUM_REG_EAX, GUM_ADDRESS(&saved_ret));
-  gum_x86_writer_put_jmp_reg_ptr(cw, GUM_REG_EAX);
+  /* The stack should be aligned when we re-enter our loop */
+  gum_x86_writer_put_and_reg_u32(cw, GUM_X86_ESP, 0xfffffff0);
+  gum_x86_writer_put_sub_reg_imm(cw, GUM_X86_ESP, 0x4);
+
+  gum_x86_writer_put_mov_reg_address(cw, GUM_X86_EAX,
+                                     GUM_ADDRESS(&persistent_loop));
+  gum_x86_writer_put_jmp_reg_ptr(cw, GUM_X86_EAX);
 
 }
 

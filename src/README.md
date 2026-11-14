@@ -3,7 +3,6 @@
 Quick explanation about the files here:
 
 - `afl-analyze.c`	- afl-analyze binary tool
-- `afl-as.c`		- afl-as binary tool
 - `afl-cc.c`		- afl-cc binary tool
 - `afl-common.c`	- common functions, used by afl-analyze, afl-fuzz, afl-showmap and afl-tmin
 - `afl-forkserver.c`	- forkserver implementation, used by afl-fuzz afl-showmap, afl-tmin
@@ -18,7 +17,7 @@ Quick explanation about the files here:
 - `afl-fuzz-performance.c`	- hash64 and rand functions
 - `afl-fuzz-python.c`	- afl-fuzz the python mutator extension
 - `afl-fuzz-queue.c`	- afl-fuzz handling the queue
-- `afl-fuzz-redqueen.c`	- afl-fuzz redqueen implemention
+- `afl-fuzz-redqueen.c`	- afl-fuzz redqueen implementation
 - `afl-fuzz-run.c`	- afl-fuzz running the target
 - `afl-fuzz-state.c`	- afl-fuzz state and globals
 - `afl-fuzz-stats.c`	- afl-fuzz writing the statistics file

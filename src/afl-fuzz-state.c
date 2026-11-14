@@ -5,17 +5,19 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
+                        Heiko Eissfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2026 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
 
-     http://www.apache.org/licenses/LICENSE-2.0
+     https://www.apache.org/licenses/LICENSE-2.0
+
+   SPDX-License-Identifier: Apache-2.0
 
    This is the real deal: the program takes an instrumented binary and
    attempts a variety of basic fuzzing tricks, paying close attention to
@@ -23,55 +25,15 @@
 
  */
 
+#include <signal.h>
+#include <limits.h>
 #include "afl-fuzz.h"
+#include "cmplog.h"
 #include "envs.h"
-
-s8  interesting_8[] = {INTERESTING_8};
-s16 interesting_16[] = {INTERESTING_8, INTERESTING_16};
-s32 interesting_32[] = {INTERESTING_8, INTERESTING_16, INTERESTING_32};
 
 char *power_names[POWER_SCHEDULES_NUM] = {"explore", "mmopt", "exploit",
                                           "fast",    "coe",   "lin",
                                           "quad",    "rare",  "seek"};
-
-/* Initialize MOpt "globals" for this afl state */
-
-static void init_mopt_globals(afl_state_t *afl) {
-
-  MOpt_globals_t *core = &afl->mopt_globals_core;
-  core->finds = afl->core_operator_finds_puppet;
-  core->finds_v2 = afl->core_operator_finds_puppet_v2;
-  core->cycles = afl->core_operator_cycles_puppet;
-  core->cycles_v2 = afl->core_operator_cycles_puppet_v2;
-  core->cycles_v3 = afl->core_operator_cycles_puppet_v3;
-  core->is_pilot_mode = 0;
-  core->pTime = &afl->tmp_core_time;
-  core->period = period_core;
-  core->havoc_stagename = "MOpt-core-havoc";
-  core->splice_stageformat = "MOpt-core-splice %u";
-  core->havoc_stagenameshort = "MOpt_core_havoc";
-  core->splice_stagenameshort = "MOpt_core_splice";
-
-  MOpt_globals_t *pilot = &afl->mopt_globals_pilot;
-  pilot->finds = afl->stage_finds_puppet[0];
-  pilot->finds_v2 = afl->stage_finds_puppet_v2[0];
-  pilot->cycles = afl->stage_cycles_puppet[0];
-  pilot->cycles_v2 = afl->stage_cycles_puppet_v2[0];
-  pilot->cycles_v3 = afl->stage_cycles_puppet_v3[0];
-  pilot->is_pilot_mode = 1;
-  pilot->pTime = &afl->tmp_pilot_time;
-  pilot->period = period_pilot;
-  pilot->havoc_stagename = "MOpt-havoc";
-  pilot->splice_stageformat = "MOpt-splice %u";
-  pilot->havoc_stagenameshort = "MOpt_havoc";
-  pilot->splice_stagenameshort = "MOpt_splice";
-
-}
-
-/* A global pointer to all instances is needed (for now) for signals to arrive
- */
-
-static list_t afl_states = {.element_prealloc_count = 0};
 
 /* Initializes an afl_state_t. */
 
@@ -81,16 +43,19 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   and out_size are NULL/0 by default. */
   memset(afl, 0, sizeof(afl_state_t));
 
-  afl->shm.map_size = map_size ? map_size : MAP_SIZE;
+  mopt_adaptive_init(afl);
 
-  afl->w_init = 0.9;
-  afl->w_end = 0.3;
-  afl->g_max = 5000;
-  afl->period_pilot_tmp = 5000.0;
-  afl->schedule = FAST;                 /* Power schedule (default: FAST)   */
+  map_size = map_size ? map_size : MAP_SIZE;
+  afl->shm.map_size = map_size;
+  afl->map_size = map_size;
+
+  afl->smallest_favored = -1;
+  afl->afl_ijon_history_limit = 20;
+  afl->schedule = EXPLORE;              /* Power schedule (default: EXPLORE)*/
   afl->havoc_max_mult = HAVOC_MAX_MULT;
-
   afl->clear_screen = 1;                /* Window resized?                  */
+  // afl->primary_trace = 1;              /* trace_bits holds the coverage map
+  // */
   afl->havoc_div = 1;                   /* Cycle count divisor for havoc    */
   afl->stage_name = "init";             /* Name of the current fuzz stage   */
   afl->splicing_with = -1;              /* Splicing with which test case?   */
@@ -99,14 +64,15 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->hang_tmout = EXEC_TIMEOUT;
   afl->exit_on_time = 0;
   afl->stats_update_freq = 1;
+  afl->stats_file_update_freq_msecs = STATS_UPDATE_SEC * 1000;
   afl->stats_avg_exec = 0;
-  afl->skip_deterministic = 1;
+  afl->skip_deterministic = 0;
+  afl->sync_time = SYNC_TIME;
   afl->cmplog_lvl = 2;
-#ifndef NO_SPLICING
-  afl->use_splicing = 1;
-#endif
+  afl->min_length = 1;
+  afl->max_length = MAX_FILE;
+  afl->switch_fuzz_mode = STRATEGY_SWITCH_TIME * 1000;
   afl->q_testcase_max_cache_size = TESTCASE_CACHE_SIZE * 1048576UL;
-  afl->q_testcase_max_cache_entries = 64 * 1024;
 
 #ifdef HAVE_AFFINITY
   afl->cpu_aff = -1;                    /* Selected CPU core                */
@@ -115,12 +81,25 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->virgin_bits = ck_alloc(map_size);
   afl->virgin_tmout = ck_alloc(map_size);
   afl->virgin_crash = ck_alloc(map_size);
+  afl->virgin_undo = ck_alloc(map_size);
+  afl->virgin_reclaim = ck_alloc(map_size);
   afl->var_bytes = ck_alloc(map_size);
   afl->top_rated = ck_alloc(map_size * sizeof(void *));
   afl->clean_trace = ck_alloc(map_size);
   afl->clean_trace_custom = ck_alloc(map_size);
   afl->first_trace = ck_alloc(map_size);
   afl->map_tmp_buf = ck_alloc(map_size);
+
+  /* Initialize IJON max tracking state */
+  afl->ijon_state = NULL;
+  afl->ijon_bits = NULL;
+  afl->last_ijon_log_time = 0;
+  afl->ijon_input_data = NULL;
+  afl->ijon_input_len = 0;
+  afl->is_doing_ijon = 0;
+
+  afl->perm = DEFAULT_PERMISSION;
+  afl->dir_perm = DEFAULT_DIRS_PERMISSION;
 
   afl->fsrv.use_stdin = 1;
   afl->fsrv.map_size = map_size;
@@ -134,9 +113,49 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->fsrv.child_pid = -1;
   afl->fsrv.out_dir_fd = -1;
 
-  init_mopt_globals(afl);
+  /* Init SkipDet */
+  afl->skipdet_g =
+      (struct skipdet_global *)ck_alloc(sizeof(struct skipdet_global));
+  afl->skipdet_g->inf_prof =
+      (struct inf_profile *)ck_alloc(sizeof(struct inf_profile));
+  afl->havoc_prof =
+      (struct havoc_profile *)ck_alloc(sizeof(struct havoc_profile));
 
-  list_append(&afl_states, afl);
+  /* 10% FrameShift overhead default */
+  afl->afl_env.afl_frameshift_max_overhead = 0.10;
+
+}
+
+void afl_resize_map_buffers(afl_state_t *afl, u32 old_size, u32 new_size) {
+
+  afl->virgin_bits = ck_realloc(afl->virgin_bits, new_size);
+  afl->virgin_tmout = ck_realloc(afl->virgin_tmout, new_size);
+  afl->virgin_crash = ck_realloc(afl->virgin_crash, new_size);
+  afl->virgin_undo = ck_realloc(afl->virgin_undo, new_size);
+  afl->virgin_reclaim = ck_realloc(afl->virgin_reclaim, new_size);
+  afl->virgin_undo_valid = 0;
+  afl->var_bytes = ck_realloc(afl->var_bytes, new_size);
+  afl->top_rated = ck_realloc(afl->top_rated, new_size * sizeof(void *));
+
+  afl->clean_trace = ck_realloc(afl->clean_trace, new_size);
+  afl->clean_trace_custom = ck_realloc(afl->clean_trace_custom, new_size);
+  afl->first_trace = ck_realloc(afl->first_trace, new_size);
+  afl->map_tmp_buf = ck_realloc(afl->map_tmp_buf, new_size);
+
+  if (old_size < new_size) {
+
+    u32 size_diff = new_size - old_size;
+
+    memset(afl->var_bytes + old_size, 0, size_diff);
+    memset(afl->virgin_reclaim + old_size, 0, size_diff);
+    memset(afl->top_rated + old_size, 0, size_diff * sizeof(void *));
+
+    memset(afl->clean_trace + old_size, 0, size_diff);
+    memset(afl->clean_trace_custom + old_size, 0, size_diff);
+    memset(afl->first_trace + old_size, 0, size_diff);
+    memset(afl->map_tmp_buf + old_size, 0, size_diff);
+
+  }
 
 }
 
@@ -160,6 +179,13 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
           "Potentially mistyped AFL environment variable: %s, did you mean "
           "AFL_%s?",
           env, env);
+      issue_detected = 1;
+
+    } else if (!strncmp(env, "AFL_CYCLE_SCHEDULES=",
+
+                        sizeof("AFL_CYCLE_SCHEDULES=") - 1)) {
+
+      WARNF("AFL_CYCLE_SCHEDULES was removed and is ignored.");
       issue_detected = 1;
 
     } else if (strncmp(env, "AFL_", 4) == 0) {
@@ -193,11 +219,25 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
             afl->afl_env.afl_exit_on_time =
                 (u8 *)get_afl_env(afl_environment_variables[i]);
 
+          } else if (!strncmp(env, "AFL_CRASHING_SEEDS_AS_NEW_CRASH",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_crashing_seeds_as_new_crash =
+                atoi((u8 *)get_afl_env(afl_environment_variables[i]));
+
           } else if (!strncmp(env, "AFL_NO_AFFINITY",
 
                               afl_environment_variable_len)) {
 
             afl->afl_env.afl_no_affinity =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_NO_WARN_INSTABILITY",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_no_warn_instability =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
           } else if (!strncmp(env, "AFL_TRY_AFFINITY",
@@ -220,6 +260,13 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
             afl->afl_env.afl_hang_tmout =
                 (u8 *)get_afl_env(afl_environment_variables[i]);
 
+          } else if (!strncmp(env, "AFL_KEEP_TIMEOUTS",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_keep_timeouts =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
           } else if (!strncmp(env, "AFL_SKIP_BIN_CHECK",
 
                               afl_environment_variable_len)) {
@@ -241,6 +288,34 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
             afl->afl_env.afl_import_first =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
+          } else if (!strncmp(env, "AFL_FINAL_SYNC",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_final_sync =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_NO_SYNC",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_no_sync =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_NO_FASTRESUME",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_no_fastresume =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_FORCE_FASTRESUME",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_force_fastresume =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
           } else if (!strncmp(env, "AFL_CUSTOM_MUTATOR_ONLY",
 
                               afl_environment_variable_len)) {
@@ -248,11 +323,42 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
             afl->afl_env.afl_custom_mutator_only =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
+          } else if (!strncmp(env, "AFL_CUSTOM_MUTATOR_LATE_SEND",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_custom_mutator_late_send =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
           } else if (!strncmp(env, "AFL_CMPLOG_ONLY_NEW",
 
                               afl_environment_variable_len)) {
 
             afl->afl_env.afl_cmplog_only_new =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_DISABLE_REDUNDANT",
+
+                              afl_environment_variable_len) ||
+                     !strncmp(env, "AFL_NO_REDUNDANT",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_disable_redundant =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_STARVED_MINIMIZE_QUEUE",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_starved_minimize_queue =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_NO_STARTUP_CALIBRATION",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_no_startup_calibration =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
           } else if (!strncmp(env, "AFL_NO_UI", afl_environment_variable_len)) {
@@ -272,6 +378,20 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
                               afl_environment_variable_len)) {
 
             afl->afl_env.afl_ignore_problems =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_IGNORE_SEED_PROBLEMS",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_ignore_seed_problems =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_IGNORE_TIMEOUTS",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_ignore_timeouts =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
           } else if (!strncmp(env, "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES",
@@ -318,13 +438,6 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
             afl->afl_env.afl_persistent_record =
                 get_afl_env(afl_environment_variables[i]);
 
-          } else if (!strncmp(env, "AFL_CYCLE_SCHEDULES",
-
-                              afl_environment_variable_len)) {
-
-            afl->cycle_schedules = afl->afl_env.afl_cycle_schedules =
-                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
-
           } else if (!strncmp(env, "AFL_EXIT_ON_SEED_ISSUES",
 
                               afl_environment_variable_len)) {
@@ -358,6 +471,13 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
                               afl_environment_variable_len)) {
 
             afl->afl_env.afl_statsd =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_POST_PROCESS_KEEP_ORIGINAL",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_post_process_keep_original =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
 
           } else if (!strncmp(env, "AFL_TMPDIR",
@@ -455,22 +575,28 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
 
                               afl_environment_variable_len)) {
 
-            afl->afl_env.afl_statsd_tags_flavor =
-                (u8 *)get_afl_env(afl_environment_variables[i]);
+            // handled elsewhere
 
           } else if (!strncmp(env, "AFL_NO_COLOUR",
 
                               afl_environment_variable_len)) {
 
-            afl->afl_env.afl_statsd_tags_flavor =
-                (u8 *)get_afl_env(afl_environment_variables[i]);
+            // handled elsewhere
+
 #endif
 
           } else if (!strncmp(env, "AFL_KILL_SIGNAL",
 
                               afl_environment_variable_len)) {
 
-            afl->afl_env.afl_kill_signal =
+            afl->afl_env.afl_child_kill_signal =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_FORK_SERVER_KILL_SIGNAL",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_fsrv_kill_signal =
                 (u8 *)get_afl_env(afl_environment_variables[i]);
 
           } else if (!strncmp(env, "AFL_TARGET_ENV",
@@ -479,6 +605,217 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
 
             afl->afl_env.afl_target_env =
                 (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_INPUT_LEN_MIN",
+
+                              afl_environment_variable_len)) {
+
+            afl->min_length =
+                atoi((u8 *)get_afl_env(afl_environment_variables[i]));
+
+          } else if (!strncmp(env, "AFL_INPUT_LEN_MAX",
+
+                              afl_environment_variable_len)) {
+
+            afl->max_length =
+                atoi((u8 *)get_afl_env(afl_environment_variables[i]));
+
+          } else if (!strncmp(env, "AFL_IJON_HISTORY_LIMIT",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_ijon_history_limit =
+                atoi((u8 *)get_afl_env(afl_environment_variables[i]));
+
+            if (afl->afl_ijon_history_limit < 0) {
+
+              afl->afl_ijon_history_limit = 0;
+
+            }
+
+          } else if (!strncmp(env, "AFL_PIZZA_MODE",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_pizza_mode =
+                atoi((u8 *)get_afl_env(afl_environment_variables[i]));
+
+          } else if (!strncmp(env, "AFL_CRASH_TRACES",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_crash_traces =
+                atoi((u8 *)get_afl_env(afl_environment_variables[i]));
+
+          } else if (!strncmp(env, "AFL_NO_CRASH_README",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_no_crash_readme =
+                atoi((u8 *)get_afl_env(afl_environment_variables[i]));
+
+          } else if (!strncmp(env, "AFL_SYNC_TIME",
+
+                              afl_environment_variable_len)) {
+
+            int time = atoi((u8 *)get_afl_env(afl_environment_variables[i]));
+            if (time > 0) {
+
+              afl->sync_time = time * (60 * 1000LL);
+
+            } else {
+
+              WARNF(
+                  "incorrect value for AFL_SYNC_TIME environment variable, "
+                  "used default value %lld instead.",
+                  afl->sync_time / 60 / 1000);
+
+            }
+
+          } else if (!strncmp(env, "AFL_FUZZER_STATS_UPDATE_INTERVAL",
+
+                              afl_environment_variable_len)) {
+
+            u64 stats_update_freq_sec =
+                strtoull(get_afl_env(afl_environment_variables[i]), NULL, 0);
+            if (stats_update_freq_sec >= UINT_MAX ||
+                0 == stats_update_freq_sec) {
+
+              WARNF(
+                  "Incorrect value given to AFL_FUZZER_STATS_UPDATE_INTERVAL, "
+                  "using default of %d seconds\n",
+                  STATS_UPDATE_SEC);
+
+            } else {
+
+              afl->stats_file_update_freq_msecs = stats_update_freq_sec * 1000;
+
+            }
+
+          } else if (!strncmp(env, "AFL_SHA1_FILENAMES",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_sha1_filenames =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_FORKSRV_UID",
+
+                              afl_environment_variable_len)) {
+
+            u8   *uid_str = (u8 *)get_afl_env(afl_environment_variables[i]);
+            char *ret;
+            int   uid = strtol(uid_str, &ret, 10);
+            if (*ret != '\0') {
+
+              WARNF("Incorrect value given to AFL_FORKSRV_UID\n");
+
+            } else {
+
+              afl->afl_env.afl_forksrv_uid_set = 1;
+              afl->afl_env.afl_forksrv_uid = uid;
+
+            }
+
+          } else if (!strncmp(env, "AFL_FORKSRV_GID",
+
+                              afl_environment_variable_len)) {
+
+            u8 *gid_str = (u8 *)get_afl_env(afl_environment_variables[i]);
+
+            // Count the number of supplementary GIDs
+            // and prepare the string for the next loop
+            afl->afl_env.afl_forksrv_nb_supl_gids = 0;
+            for (u32 i = 0; gid_str[i] != '\0'; i++) {
+
+              if (gid_str[i] == ',') {
+
+                afl->afl_env.afl_forksrv_nb_supl_gids++;
+                gid_str[i] = '\0';
+
+              }
+
+            }
+
+            if (afl->afl_env.afl_forksrv_nb_supl_gids > 0) {
+
+              afl->afl_env.afl_forksrv_supl_gids = ck_alloc(
+                  sizeof(gid_t) * afl->afl_env.afl_forksrv_nb_supl_gids);
+
+            }
+
+            for (u16 i = 0; i < afl->afl_env.afl_forksrv_nb_supl_gids + 1;
+                 i++) {
+
+              char *ret;
+              int   gid = strtol(gid_str, &ret, 10);
+
+              if (*ret != '\0') {
+
+                WARNF("Incorrect value given to AFL_FORKSRV_GID\n");
+
+                afl->afl_env.afl_forksrv_gid_set = 0;
+                afl->afl_env.afl_forksrv_gid = 0;
+                free(afl->afl_env.afl_forksrv_supl_gids);
+
+                break;
+
+              } else {
+
+                // First GID is the effective one, others are supplementary
+                // ones.
+                if (i == 0) {
+
+                  afl->afl_env.afl_forksrv_gid_set = 1;
+                  afl->afl_env.afl_forksrv_gid = gid;
+
+                } else {
+
+                  afl->afl_env.afl_forksrv_supl_gids[i - 1] = gid;
+
+                }
+
+                // Jump to next GID
+                gid_str = ret + 1;
+
+              }
+
+            }
+
+          } else if (!strncmp(env, "AFL_FRAMESHIFT_DISABLE",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_frameshift_disabled =
+                get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_FRAMESHIFT_MAX_OVERHEAD",
+
+                              afl_environment_variable_len)) {
+
+            char *val = (char *)get_afl_env(afl_environment_variables[i]);
+
+            char  *endptr = NULL;
+            double ov = strtod(val, &endptr);
+            if (endptr == val || *endptr != '\0') {
+
+              WARNF(
+                  "Invalid value given to AFL_FRAMESHIFT_MAX_OVERHEAD "
+                  "'%s' - keeping default %.2f",
+                  val, afl->afl_env.afl_frameshift_max_overhead);
+
+            } else if (ov < 0.0 || ov > 1.0) {
+
+              WARNF(
+                  "AFL_FRAMESHIFT_MAX_OVERHEAD value out of range [0.0,1.0], "
+                  "keeping default %.2f",
+                  afl->afl_env.afl_frameshift_max_overhead);
+
+            } else {
+
+              afl->afl_env.afl_frameshift_max_overhead = ov;
+
+            }
 
           }
 
@@ -541,6 +878,16 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
 
   }
 
+  if (afl->afl_env.afl_pizza_mode > 0) {
+
+    afl->pizza_is_served = 1;
+
+  } else if (afl->afl_env.afl_pizza_mode < 0) {
+
+    OKF("Pizza easter egg mode is now disabled.");
+
+  }
+
   if (issue_detected) { sleep(2); }
 
 }
@@ -552,58 +899,87 @@ void afl_state_deinit(afl_state_t *afl) {
   if (afl->in_place_resume) { ck_free(afl->in_dir); }
   if (afl->sync_id) { ck_free(afl->out_dir); }
   if (afl->pass_stats) { ck_free(afl->pass_stats); }
-  if (afl->orig_cmp_map) { ck_free(afl->orig_cmp_map); }
+  if (afl->min_slack) { ck_free(afl->min_slack); }
+  if (afl->min_slack_ids) { ck_free(afl->min_slack_ids); }
+  if (afl->orig_cmp_map) {
+
+    afl_free(afl->orig_cmp_map->log);
+    ck_free(afl->orig_cmp_map);
+
+  }
+
+  if (afl->cmplog_binary) { ck_free(afl->cmplog_binary); }
+  if (afl->sync_states) {
+
+    for (u32 i = 0; i < afl->sync_states_cnt; ++i) {
+
+      ck_free(afl->sync_states[i].name);
+
+    }
+
+    ck_free(afl->sync_states);
+
+  }
 
   afl_free(afl->queue_buf);
   afl_free(afl->out_buf);
   afl_free(afl->out_scratch_buf);
+  afl_free(afl->trim_scratch_buf);
+  afl_free(afl->post_process_orig_buf);
+  afl_free(afl->post_process_orig_buf_scratch);
   afl_free(afl->eff_buf);
   afl_free(afl->in_buf);
   afl_free(afl->in_scratch_buf);
   afl_free(afl->ex_buf);
+  free(afl->alias_table);
+  free(afl->alias_probability);
+  free(afl->splice_buf_ids);
+  if (afl->testcase_buf) { afl_free(afl->testcase_buf); }
+  if (afl->splicecase_buf) { afl_free(afl->splicecase_buf); }
+
+  if (afl->fsrv.use_ijon) { afl_free(afl->ijon_input_data); }
 
   ck_free(afl->virgin_bits);
   ck_free(afl->virgin_tmout);
   ck_free(afl->virgin_crash);
   ck_free(afl->var_bytes);
   ck_free(afl->top_rated);
+  if (afl->vp_frontier) { ck_free(afl->vp_frontier); }
+  if (afl->vp_focus_bitmap) { ck_free(afl->vp_focus_bitmap); }
+  if (afl->vp_focus_prev) { ck_free(afl->vp_focus_prev); }
+  if (afl->vp_focus_relevant) { ck_free(afl->vp_focus_relevant); }
+  if (afl->vp_site_idle) { ck_free(afl->vp_site_idle); }
+  if (afl->vp_site_owned) { ck_free(afl->vp_site_owned); }
+
   ck_free(afl->clean_trace);
   ck_free(afl->clean_trace_custom);
   ck_free(afl->first_trace);
   ck_free(afl->map_tmp_buf);
 
-  list_remove(&afl_states, afl);
+  /* Free IJON max tracking state */
+  if (afl->ijon_state) {
 
-}
+    destroy_ijon_min_state((ijon_min_state *)afl->ijon_state);
+    afl->ijon_state = NULL;
+    afl->ijon_bits = NULL;
 
-void afl_states_stop(void) {
+    if (afl->ijon_shared_access) {
 
-  /* We may be inside a signal handler.
-   Set flags first, send kill signals to child proceses later. */
-  LIST_FOREACH(&afl_states, afl_state_t, {
+      cleanup_dynamic_shared_access(afl->ijon_shared_access);
+      afl->ijon_shared_access = NULL;
 
-    el->stop_soon = 1;
+    }
 
-  });
+    afl->ijon_input_len = 0;
 
-  LIST_FOREACH(&afl_states, afl_state_t, {
+  }
 
-    if (el->fsrv.child_pid > 0) kill(el->fsrv.child_pid, el->fsrv.kill_signal);
-    if (el->fsrv.fsrv_pid > 0) kill(el->fsrv.fsrv_pid, el->fsrv.kill_signal);
+  ck_free(afl->skipdet_g->inf_prof);
+  ck_free(afl->skipdet_g->virgin_det_bits);
+  ck_free(afl->skipdet_g);
+  ck_free(afl->havoc_prof);
 
-  });
-
-}
-
-void afl_states_clear_screen(void) {
-
-  LIST_FOREACH(&afl_states, afl_state_t, { el->clear_screen = 1; });
-
-}
-
-void afl_states_request_skip(void) {
-
-  LIST_FOREACH(&afl_states, afl_state_t, { el->skip_requested = 1; });
+  ck_free(afl->afl_env.afl_forksrv_supl_gids);
 
 }
 

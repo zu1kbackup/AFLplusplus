@@ -11,12 +11,12 @@
 #include <dlfcn.h>
 
 #ifdef __ANDROID__
-  #include "../include/android-ashmem.h"
+  #include "../../include/android-ashmem.h"
 #endif
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
-#include "../config.h"
+#include "../../config.h"
 
 #include <QBDI.h>
 
@@ -80,8 +80,8 @@ static void afl_forkserver() {
 
   while (1) {
 
-    int status;
-    u32 was_killed;
+    int          status;
+    unsigned int was_killed;
     // wait for afl-fuzz
     if (read(FORKSRV_FD, &was_killed, 4) != 4) exit(2);
 
@@ -123,12 +123,20 @@ void afl_maybe_log(unsigned long cur_loc) {
 char *read_file(char *path, unsigned long *length) {
 
   unsigned long len;
-  char *        buf;
+  char         *buf;
 
   FILE *fp = fopen(path, "rb");
   fseek(fp, 0, SEEK_END);
   len = ftell(fp);
   buf = (char *)malloc(len);
+  if (!buf) {
+
+    /** It handles the failure of dynamic memory allocation **/
+    fclose(fp);
+    return NULL;
+
+  }
+
   rewind(fp);
   fread(buf, 1, len, fp);
   fclose(fp);
@@ -142,7 +150,7 @@ QBDI_NOINLINE int fuzz_func() {
   if (afl_setup()) { afl_forkserver(); }
 
   unsigned long len = 0;
-  char *        data = read_file(input_pathname, &len);
+  char         *data = read_file(input_pathname, &len);
 
   // printf("In fuzz_func\n");
   p_target_func(data, len);
@@ -152,7 +160,7 @@ QBDI_NOINLINE int fuzz_func() {
 
 static QBDI::VMAction bbcallback(QBDI::VMInstanceRef  vm,
                                  const QBDI::VMState *state,
-                                 QBDI::GPRState *     gprState,
+                                 QBDI::GPRState      *gprState,
                                  QBDI::FPRState *fprState, void *data) {
 
   // errno = SAVED_ERRNO;

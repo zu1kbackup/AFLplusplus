@@ -5,18 +5,20 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                     Heiko Eißfeldt <heiko.eissfeldt@hexco.de>,
-                     Andrea Fioraldi <andreafioraldi@gmail.com>,
                      Dominik Maier <mail@dmnk.co>
+                     Andrea Fioraldi <andreafioraldi@gmail.com>,
+                     Heiko Eissfeldt <heiko.eissfeldt@hexco.de>,
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2021 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2026 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
 
-     http://www.apache.org/licenses/LICENSE-2.0
+     https://www.apache.org/licenses/LICENSE-2.0
+
+   SPDX-License-Identifier: Apache-2.0
 
  */
 
@@ -26,7 +28,26 @@
 /* Version string: */
 
 // c = release, a = volatile github dev, e = experimental branch
-#define VERSION "++3.15a"
+#define VERSION "++5.04a"
+
+/* Which flavour of shared memory the tools and the target agree on. USEMMAP
+   selects POSIX shared memory (shm_open/mmap), otherwise SysV segments are
+   used. macOS is deliberately kept off SysV even though shmat() works there:
+   kern.sysv.shmseg caps a process at 8 segments and kern.sysv.shmmax a
+   segment at 4 MB by default (CmpLog alone needs ~145 MB), and a segment can
+   no longer be attached once it is marked for destruction, so a SIGKILLed
+   tool leaks it. POSIX shared memory handed over as an inherited descriptor
+   (see SHM_FD_ENV_VAR) has none of those problems.
+
+   This lives here rather than only in the makefiles so that every consumer of
+   config.h agrees - the struct in sharedmem.h has a different layout for each
+   flavour, so a build where only some objects got -DUSEMMAP would corrupt
+   memory. The makefiles still set it for the platforms detected at build
+   time, which is why this is guarded. */
+
+#if defined(__APPLE__) && !defined(USEMMAP)
+  #define USEMMAP 1
+#endif
 
 /******************************************************
  *                                                    *
@@ -39,12 +60,47 @@
    However if a target has problematic constructors and init arrays then
    this can fail. Hence afl-fuzz deploys a larger default map. The largest
    map seen so far is the xlsx fuzzer for libreoffice which is 5MB.
-   At runtime this value can be overriden via AFL_MAP_SIZE.
+   At runtime this value can be overridden via AFL_MAP_SIZE.
    Default: 8MB (defined in bytes) */
 #define DEFAULT_SHMEM_SIZE (8 * 1024 * 1024)
 
+#define SAN_DEDUP_DEFAULT_MB 8
+#define SAN_DEDUP_MAX_MB 4096
+
+/* Default time until when no more coverage finds are happening afl-fuzz
+   switches to exploitation mode. It automatically switches back when new
+   coverage is found.
+   Default: 1000 (seconds) */
+#define STRATEGY_SWITCH_TIME 1000
+#define STARVE_EDGE_EXECS (5000000ULL)
+#define SWITCH_EXECS (6000000ULL)
+#define CMPLOG_I2S_EXECS (2000000ULL)
+#define SKIPDET_DECAY_EXECS (9000000ULL)
+#define MAX_EFF_EXECS (5500000ULL)
+#define MAX_DET_EXECS (8000000ULL)
+
+/* Default file permission umode when creating directories */
+#define DEFAULT_DIRS_PERMISSION 0700
+
 /* Default file permission umode when creating files (default: 0600) */
 #define DEFAULT_PERMISSION 0600
+
+#ifdef __APPLE__
+  #include <TargetConditionals.h>
+  #if TARGET_OS_IOS
+    #undef DEFAULT_PERMISSION
+    #define DEFAULT_PERMISSION 0666
+  #endif
+#endif
+#ifdef __ANDROID__
+  #undef DEFAULT_PERMISSION
+  #define DEFAULT_PERMISSION 0666
+#endif
+
+/* SkipDet's global configuration */
+
+#define MINIMAL_BLOCK_SIZE 64
+#define MAXIMUM_QUICK_EFF_EXECS (64 * 1024U)
 
 /* CMPLOG/REDQUEEN TUNING
  *
@@ -54,10 +110,6 @@
  *
  */
 
-/* if TRANSFORM is enabled with '-l T', this additionally enables base64
-   encoding/decoding */
-// #define CMPLOG_SOLVE_TRANSFORM_BASE64
-
 /* If a redqueen pass finds more than one solution, try to combine them? */
 #define CMPLOG_COMBINE
 
@@ -65,23 +117,34 @@
 #define CMPLOG_CORPUS_PERCENT 5U
 
 /* Number of potential positions from which we decide if cmplog becomes
-   useless, default 8096 */
+   useless, default 12288 */
 #define CMPLOG_POSITIONS_MAX (12 * 1024)
 
-/* Maximum allowed fails per CMP value. Default: 128 */
+/* Maximum allowed fails per CMP value. Default: 96 */
 #define CMPLOG_FAIL_MAX 96
+
+/*
+ * Effective fuzzing with selective feeding inputs
+ */
+
+#define MAX_EXTRA_SAN_BINARY 4
 
 /* -------------------------------------*/
 /* Now non-cmplog configuration options */
 /* -------------------------------------*/
 
-/* If a persistent target keeps state and found crashes are not reproducable
+/* If a persistent target keeps state and found crashes are not reproducible
    then enable this option and set the AFL_PERSISTENT_RECORD env variable
    to a number. These number of testcases prior and including the crash case
    will be kept and written to the crash/ directory as RECORD:... files.
    Note that every crash will be written, not only unique ones! */
 
-//#define AFL_PERSISTENT_RECORD
+// #define AFL_PERSISTENT_RECORD
+
+/* Adds support in compiler-rt to replay persistent records in @@-style
+ * harnesses */
+
+//  #define AFL_PERSISTENT_REPLAY_ARGPARSE
 
 /* console output colors: There are three ways to configure its behavior
  * 1. default: colored outputs fixed on: defined USE_COLOR && defined
@@ -118,9 +181,9 @@
 
 // #define _WANT_ORIGINAL_AFL_ALLOC
 
-/* Comment out to disable fancy ANSI boxes and use poor man's 7-bit UI: */
+/* Comment out to disable fancy boxes and use poor man's 7-bit UI: */
 
-#ifndef ANDROID_DISABLE_FANCY  // Fancy boxes are ugly from adb
+#ifndef DISABLE_FANCY
   #define FANCY_BOXES
 #endif
 
@@ -133,8 +196,19 @@
 
 #define EXEC_TM_ROUND 20U
 
+/* Rate limit for every -t <n>+ timeout probe that may run for the full
+   ceiling (milliseconds). The effective interval is the larger of this and
+   100x the -t ceiling, which bounds the probe overhead at 1% of wall clock
+   time: */
+
+#ifndef TMOUT_PROBE_INTERVAL
+  #define TMOUT_PROBE_INTERVAL 60000U
+#endif
+
 /* 64bit arch MACRO */
-#if (defined(__x86_64__) || defined(__arm64__) || defined(__aarch64__))
+#if (defined(__x86_64__) || defined(__arm64__) || defined(__aarch64__) ||    \
+     (defined(__riscv) && __riscv_xlen == 64) || defined(__powerpc64le__) || \
+     defined(__s390x__) || defined(__loongarch64))
   #define WORD_SIZE_64 1
 #endif
 
@@ -153,8 +227,9 @@
 /* Number of calibration cycles per every new test case (and for test
    cases that show variable behavior): */
 
-#define CAL_CYCLES 8U
-#define CAL_CYCLES_LONG 20U
+#define CAL_CYCLES_FAST 3U
+#define CAL_CYCLES 7U
+#define CAL_CYCLES_LONG 12U
 
 /* Number of subsequent timeouts before abandoning an input file: */
 
@@ -162,8 +237,8 @@
 
 /* Maximum number of unique hangs or crashes to record: */
 
-#define KEEP_UNIQUE_HANG 500U
-#define KEEP_UNIQUE_CRASH 10000U
+#define KEEP_UNIQUE_HANG 512U
+#define KEEP_UNIQUE_CRASH 25600U
 
 /* Baseline number of random tweaks during a single 'havoc' stage: */
 
@@ -174,7 +249,6 @@
    of 32-bit int overflows): */
 
 #define HAVOC_MAX_MULT 64U
-#define HAVOC_MAX_MULT_MOPT 64U
 
 /* Absolute minimum number of havoc cycles (after all adjustments): */
 
@@ -237,11 +311,11 @@
    (note that if this value is changed, several areas in afl-cc.c, afl-fuzz.c
    and afl-fuzz-state.c have to be changed as well! */
 
-#define MAX_FILE (1 * 1024 * 1024U)
+#define MAX_FILE (1 * 1024 * 1024L)
 
 /* The same, for the test case minimizer: */
 
-#define TMIN_MAX_FILE (10 * 1024 * 1024)
+#define TMIN_MAX_FILE (10 * 1024 * 1024L)
 
 /* Block normalization steps for afl-tmin: */
 
@@ -267,45 +341,35 @@
    (first value), and to keep in memory as candidates. The latter should be much
    higher than the former. */
 
-#define USE_AUTO_EXTRAS 128
-#define MAX_AUTO_EXTRAS (USE_AUTO_EXTRAS * 64)
-
-/* Scaling factor for the effector map used to skip some of the more
-   expensive deterministic steps. The actual divisor is set to
-   2^EFF_MAP_SCALE2 bytes: */
-
-#define EFF_MAP_SCALE2 3
-
-/* Minimum input file length at which the effector logic kicks in: */
-
-#define EFF_MIN_LEN 128
-
-/* Maximum effector density past which everything is just fuzzed
-   unconditionally (%): */
-
-#define EFF_MAX_PERC 90
+#define USE_AUTO_EXTRAS 4096
+#define MAX_AUTO_EXTRAS (USE_AUTO_EXTRAS * 8)
 
 /* UI refresh frequency (Hz): */
 
 #define UI_TARGET_HZ 5
 
-/* Fuzzer stats file and plot update intervals (sec): */
+/* Fuzzer stats file, queue stats and plot update intervals (sec): */
 
 #define STATS_UPDATE_SEC 60
 #define PLOT_UPDATE_SEC 5
+#define QUEUE_UPDATE_SEC 1800
 
 /* Smoothing divisor for CPU load and exec speed stats (1 - no smoothing). */
 
 #define AVG_SMOOTHING 16
+
+/* Max length of sync id (the id after -M and -S) */
+
+#define SYNC_ID_MAX_LEN 50
 
 /* Sync interval (every n havoc cycles): */
 
 #define SYNC_INTERVAL 8
 
 /* Sync time (minimum time between syncing in ms, time is halfed for -M main
-   nodes) - default is 30 minutes: */
+   nodes) - default is 20 minutes: */
 
-#define SYNC_TIME (30 * 60 * 1000)
+#define SYNC_TIME (20 * 60 * 1000)
 
 /* Output directory reuse grace period (minutes): */
 
@@ -352,9 +416,10 @@
       65535,      /* Overflow unsig 16-bit when incremented  */ \
       65536,      /* Overflow unsig 16 bit                   */ \
       100663045,  /* Large positive number (endian-agnostic) */ \
+      2139095040, /* float infinite                          */ \
       2147483647                 /* Overflow signed 32-bit when incremented */
 
-#define INTERESTING_32_LEN 8
+#define INTERESTING_32_LEN 9
 
 /***********************************************************
  *                                                         *
@@ -362,9 +427,9 @@
  *                                                         *
  ***********************************************************/
 
-/* Call count interval between reseeding the libc PRNG from /dev/urandom: */
+/* Call count interval between reseeding the PRNG from /dev/urandom: */
 
-#define RESEED_RNG 100000
+#define RESEED_RNG 2500000
 
 /* The default maximum testcase cache size in MB, 0 = disable.
    A value between 50 and 250 is a good default value. Note that the
@@ -382,14 +447,29 @@
 
 #define SHM_ENV_VAR "__AFL_SHM_ID"
 
-/* Environment variable used to pass SHM FUZZ ID to the called program. */
+/* Environment variable used to pass shared memory fuzz map id
+and the mapping size to the called program. */
 
 #define SHM_FUZZ_ENV_VAR "__AFL_SHM_FUZZ_ID"
+#define SHM_FUZZ_MAP_SIZE_ENV_VAR "__AFL_SHM_FUZZ_MAP_SIZE"
+
+/* Environment variables carrying the *descriptor* of a shared map instead of
+   a name or a SysV id. Wherever the maps are POSIX shared memory (USEMMAP
+   builds, which includes macOS) the fuzzer shm_open()s them, mmap()s them and
+   shm_unlink()s the name straight away, so a SIGKILLed tool cannot leave
+   anything behind. What the target gets is the still-open descriptor, whose
+   number is passed here. A target built by an older afl-cc does not know
+   these variables and falls back to SHM_ENV_VAR & co. */
+
+#define SHM_FD_ENV_VAR "__AFL_SHM_FD"
+#define SHM_FUZZ_FD_ENV_VAR "__AFL_SHM_FUZZ_FD"
+
+/* Default size of the shared memory fuzz map.
+We add 4 byte for one u32 length field. */
+#define SHM_FUZZ_MAP_SIZE_DEFAULT (MAX_FILE + 4)
 
 /* Other less interesting, internal-only variables. */
 
-#define CLANG_ENV_VAR "__AFL_CLANG_MODE"
-#define AS_LOOP_ENV_VAR "__AFL_AS_LOOPCHECK"
 #define PERSIST_ENV_VAR "__AFL_PERSISTENT"
 #define DEFER_ENV_VAR "__AFL_DEFER_FORKSRV"
 
@@ -415,6 +495,14 @@
 
 #define FORKSRV_FD 198
 
+/* Lowest descriptor number a shared map may be handed over on (see
+   SHM_FD_ENV_VAR). Starting above FORKSRV_FD + 1 keeps the maps clear of the
+   forkserver control and status pipes; SHM_FD_COUNT is how many slots the
+   range reserves (trace, cmplog, value profile, state, shmem input, spare). */
+
+#define SHM_FD_MIN (FORKSRV_FD + 2)
+#define SHM_FD_COUNT 8
+
 /* Fork server init timeout multiplier: we'll wait the user-selected
    timeout plus this much for the fork server to spin up. */
 
@@ -431,6 +519,20 @@
 
 #define CAL_CHANCES 3
 
+/* Upper bound on how many queue entries may be skipped in a row before the
+   queue driver returns to the main loop. Skipping is normal, but the main
+   loop is where the -V / -E limits, cull_queue() and the alias table live,
+   so it must always be reachable: */
+
+#define QUEUE_SKIP_STREAK_MAX 1024
+
+/* How often the coverage of an entry that failed calibration is handed back
+   to virgin_bits, counted per map byte. A path that can never be calibrated
+   would otherwise be rediscovered and requeued without bound, so beyond this
+   the claim stays in place: */
+
+#define CAL_RECLAIM_MAX 3
+
 /* Map size for the traced binary (2^MAP_SIZE_POW2). Must be greater than
    2; you probably want to keep it under 18 or so for performance reasons
    (adjusting AFL_INST_RATIO when compiling is probably a better way to solve
@@ -438,7 +540,47 @@
    after changing this - otherwise, SEGVs may ensue. */
 
 #define MAP_SIZE_POW2 16
+
+/* Do not change this unless you really know what you are doing. */
+
 #define MAP_SIZE (1U << MAP_SIZE_POW2)
+#if MAP_SIZE <= 2097152
+  #define MAP_INITIAL_SIZE (2 << 20)  // = 2097152
+#else
+  #define MAP_INITIAL_SIZE MAP_SIZE
+#endif
+
+/* IJON max tracking map configuration */
+
+/* Number of IJON slots (power-of-2 for efficient bitmasking) */
+#define MAP_SIZE_IJON_ENTRIES 512
+
+/* IJON map size for set/inc/xor */
+#define MAP_SIZE_IJON_MAP 65536
+
+/* IJON map footprint in bytes (64-bit values for legacy compatibility) */
+#define MAP_SIZE_IJON_BYTES (MAP_SIZE_IJON_ENTRIES * sizeof(u64))  // = 4096
+
+/* Bug-pass map. Holds u32 slots; runtime keeps the max value seen per slot
+   (like IJON). Layout: appended after the IJON region in __afl_area_ptr. */
+#define MAP_SIZE_BUG_ENTRIES (1U << 14)
+#define MAP_SIZE_BUG_BYTES (MAP_SIZE_BUG_ENTRIES * sizeof(u32))
+
+/* AllocSizeOracle (AFL_LLVM_BUG_ALLOCSIZE) shadow.
+   1 u16 per 64-byte granule covering 16 GB of tracked address space.
+   The u16 width caps MAP_SIZE_ALLOCRECORDS at 65535.  mmap'd
+   MAP_NORESERVE so physical pages are lazy. */
+#define MAP_SIZE_ALLOCSHADOW_GRANULE_LOG2 6                     /* 64 bytes */
+#define MAP_SIZE_ALLOCSHADOW_RANGE (1ULL << 34)                    /* 16 GB */
+#define MAP_SIZE_ALLOCSHADOW_GRANULES \
+  (MAP_SIZE_ALLOCSHADOW_RANGE >> MAP_SIZE_ALLOCSHADOW_GRANULE_LOG2)
+#define MAP_SIZE_ALLOCSHADOW_BYTES \
+  (MAP_SIZE_ALLOCSHADOW_GRANULES * sizeof(u16))                   /* 512 MB */
+
+/* Live allocation records. Index 0 is reserved for "untracked"; 1..N-1
+   correspond to active allocations. Coupled to the u16 shadow byte
+   (see MAP_SIZE_ALLOCSHADOW_BYTES). */
+#define MAP_SIZE_ALLOCRECORDS 4096
 
 /* Maximum allocator request size (keep well under INT_MAX): */
 
@@ -461,6 +603,20 @@
 /* AFL RedQueen */
 
 #define CMPLOG_SHM_ENV_VAR "__AFL_CMPLOG_SHM_ID"
+#define VP_SHM_ENV_VAR "__AFL_VP_SHM_ID"
+
+/* Descriptor-passing variants of the two above (see SHM_FD_ENV_VAR) */
+#define CMPLOG_SHM_FD_ENV_VAR "__AFL_CMPLOG_SHM_FD"
+#define VP_SHM_FD_ENV_VAR "__AFL_VP_SHM_FD"
+
+#define VP_FOCUS_TARGET_SITES 4096U
+
+#define VP_IDLE_RETIRE_CYCLES 4U
+
+#define VP_FRONTIER_WEIGHT_MULT 16.0
+
+/* ASAN SHM ID */
+#define AFL_ASAN_FUZZ_SHM_ENV_VAR "__AFL_ASAN_SHM_ID"
 
 /* CPU Affinity lockfile env var */
 
@@ -489,22 +645,14 @@
 
 #define AFL_TXT_MIN_LEN 12
 
-/* What is the minimum percentage of ascii characters present to be classifed
+/* Maximum length of a queue input to be evaluated for "is_ascii"? */
+
+#define AFL_TXT_MAX_LEN 65535
+
+/* What is the minimum percentage of ascii characters present to be classified
    as "is_ascii"? */
 
-#define AFL_TXT_MIN_PERCENT 94
-
-/* How often to perform ASCII mutations 0 = disable, 1-8 are good values */
-
-#define AFL_TXT_BIAS 6
-
-/* Maximum length of a string to tamper with */
-
-#define AFL_TXT_STRING_MAX_LEN 1024
-
-/* Maximum mutations on a string */
-
-#define AFL_TXT_STRING_MAX_MUTATIONS 6
+#define AFL_TXT_MIN_PERCENT 99
 
 #endif                                                  /* ! _HAVE_CONFIG_H */
 

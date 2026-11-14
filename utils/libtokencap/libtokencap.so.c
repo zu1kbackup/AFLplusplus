@@ -6,7 +6,7 @@
    Originally written by Michal Zalewski
 
    Copyright 2016 Google Inc. All rights reserved.
-   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2024 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -33,6 +33,8 @@
 #include "../types.h"
 #include "../config.h"
 
+#include "debug.h"
+
 #if !defined __linux__ && !defined __APPLE__ && !defined __FreeBSD__ &&      \
     !defined __OpenBSD__ && !defined __NetBSD__ && !defined __DragonFly__ && \
     !defined(__HAIKU__) && !defined(__sun)
@@ -53,12 +55,17 @@
 #elif defined __HAIKU__
   #include <kernel/image.h>
 #elif defined __sun
-  /* For map addresses the old struct is enough */
+/* For map addresses the old struct is enough */
   #include <sys/procfs.h>
   #include <limits.h>
 #endif
 
 #include <dlfcn.h>
+
+#ifdef __APPLE__
+  /* fishhook is used and it is from https://github.com/facebook/fishhook */
+  #include "../macos_fishhook/fishhook.h"
+#endif
 
 #ifdef RTLD_NEXT
 /* The libc functions are a magnitude faster than our replacements.
@@ -79,7 +86,11 @@ void *(*__libc_memmem)(const void *haystack, size_t haystack_len,
 
 #define MAX_MAPPINGS 1024
 
-static struct mapping { void *st, *en; } __tokencap_ro[MAX_MAPPINGS];
+static struct mapping {
+
+  void *st, *en;
+
+} __tokencap_ro[MAX_MAPPINGS];
 
 static u32   __tokencap_ro_cnt;
 static u8    __tokencap_ro_loaded;
@@ -161,15 +172,15 @@ static void __tokencap_load_mappings(void) {
 
 #elif defined __FreeBSD__ || defined __OpenBSD__ || defined __NetBSD__
 
-  #if defined   __FreeBSD__
-  int    mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_VMMAP, __tokencap_pid};
+  #if defined __FreeBSD__
+  int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_VMMAP, __tokencap_pid};
   #elif defined __OpenBSD__
   int mib[] = {CTL_KERN, KERN_PROC_VMMAP, __tokencap_pid};
   #elif defined __NetBSD__
   int mib[] = {CTL_VM, VM_PROC, VM_PROC_MAP, __tokencap_pid,
                sizeof(struct kinfo_vmentry)};
   #endif
-  char * buf, *low, *high;
+  char  *buf, *low, *high;
   size_t miblen = sizeof(mib) / sizeof(mib[0]);
   size_t len;
 
@@ -177,7 +188,7 @@ static void __tokencap_load_mappings(void) {
 
   #if defined __FreeBSD__ || defined __NetBSD__
   len = len * 4 / 3;
-  #elif defined                      __OpenBSD__
+  #elif defined __OpenBSD__
   len -= len % sizeof(struct kinfo_vmentry);
   #endif
 
@@ -202,8 +213,8 @@ static void __tokencap_load_mappings(void) {
 
   #if defined __FreeBSD__ || defined __NetBSD__
 
-    #if defined   __FreeBSD__
-    size_t                size = region->kve_structsize;
+    #if defined __FreeBSD__
+    size_t size = region->kve_structsize;
 
     if (size == 0) break;
     #elif defined __NetBSD__
@@ -343,6 +354,8 @@ static void __tokencap_dump(const u8 *ptr, size_t len, u8 is_text) {
   wrt_ok &= (pos == write(__tokencap_out_file, buf, pos));
   wrt_ok &= (2 == write(__tokencap_out_file, "\"\n", 2));
 
+  if (!wrt_ok) { DEBUGF("%s", "writing to the token file failed\n"); }
+
 }
 
 /* Replacements for strcmp(), memcmp(), and so on. Note that these will be used
@@ -350,7 +363,7 @@ static void __tokencap_dump(const u8 *ptr, size_t len, u8 is_text) {
 
 #undef strcmp
 
-int strcmp(const char *str1, const char *str2) {
+__attribute__((hot)) int strcmp(const char *str1, const char *str2) {
 
   if (__tokencap_is_ro(str1)) __tokencap_dump(str1, strlen(str1), 1);
   if (__tokencap_is_ro(str2)) __tokencap_dump(str2, strlen(str2), 1);
@@ -374,7 +387,8 @@ int strcmp(const char *str1, const char *str2) {
 
 #undef strncmp
 
-int strncmp(const char *str1, const char *str2, size_t len) {
+__attribute__((hot)) int strncmp(const char *str1, const char *str2,
+                                 size_t len) {
 
   if (__tokencap_is_ro(str1)) __tokencap_dump(str1, len, 1);
   if (__tokencap_is_ro(str2)) __tokencap_dump(str2, len, 1);
@@ -400,7 +414,7 @@ int strncmp(const char *str1, const char *str2, size_t len) {
 
 #undef strcasecmp
 
-int strcasecmp(const char *str1, const char *str2) {
+__attribute__((hot)) int strcasecmp(const char *str1, const char *str2) {
 
   if (__tokencap_is_ro(str1)) __tokencap_dump(str1, strlen(str1), 1);
   if (__tokencap_is_ro(str2)) __tokencap_dump(str2, strlen(str2), 1);
@@ -424,7 +438,8 @@ int strcasecmp(const char *str1, const char *str2) {
 
 #undef strncasecmp
 
-int strncasecmp(const char *str1, const char *str2, size_t len) {
+__attribute__((hot)) int strncasecmp(const char *str1, const char *str2,
+                                     size_t len) {
 
   if (__tokencap_is_ro(str1)) __tokencap_dump(str1, len, 1);
   if (__tokencap_is_ro(str2)) __tokencap_dump(str2, len, 1);
@@ -450,7 +465,8 @@ int strncasecmp(const char *str1, const char *str2, size_t len) {
 
 #undef memcmp
 
-int memcmp(const void *mem1, const void *mem2, size_t len) {
+__attribute__((hot)) int memcmp(const void *mem1, const void *mem2,
+                                size_t len) {
 
   if (__tokencap_is_ro(mem1)) __tokencap_dump(mem1, len, 0);
   if (__tokencap_is_ro(mem2)) __tokencap_dump(mem2, len, 0);
@@ -477,7 +493,7 @@ int memcmp(const void *mem1, const void *mem2, size_t len) {
 
 #undef bcmp
 
-int bcmp(const void *mem1, const void *mem2, size_t len) {
+__attribute__((hot)) int bcmp(const void *mem1, const void *mem2, size_t len) {
 
   if (__tokencap_is_ro(mem1)) __tokencap_dump(mem1, len, 0);
   if (__tokencap_is_ro(mem2)) __tokencap_dump(mem2, len, 0);
@@ -504,7 +520,7 @@ int bcmp(const void *mem1, const void *mem2, size_t len) {
 
 #undef strstr
 
-char *strstr(const char *haystack, const char *needle) {
+__attribute__((hot)) char *strstr(const char *haystack, const char *needle) {
 
   if (__tokencap_is_ro(haystack))
     __tokencap_dump(haystack, strlen(haystack), 1);
@@ -533,7 +549,8 @@ char *strstr(const char *haystack, const char *needle) {
 
 #undef strcasestr
 
-char *strcasestr(const char *haystack, const char *needle) {
+__attribute__((hot)) char *strcasestr(const char *haystack,
+                                      const char *needle) {
 
   if (__tokencap_is_ro(haystack))
     __tokencap_dump(haystack, strlen(haystack), 1);
@@ -562,8 +579,8 @@ char *strcasestr(const char *haystack, const char *needle) {
 
 #undef memmem
 
-void *memmem(const void *haystack, size_t haystack_len, const void *needle,
-             size_t needle_len) {
+__attribute__((hot)) void *memmem(const void *haystack, size_t haystack_len,
+                                  const void *needle, size_t needle_len) {
 
   if (__tokencap_is_ro(haystack)) __tokencap_dump(haystack, haystack_len, 1);
 
@@ -781,6 +798,25 @@ __attribute__((constructor)) void __tokencap_init(void) {
   __libc_strstr = dlsym(RTLD_NEXT, "strstr");
   __libc_strcasestr = dlsym(RTLD_NEXT, "strcasestr");
   __libc_memmem = dlsym(RTLD_NEXT, "memmem");
+#endif
+
+#ifdef __APPLE__
+  rebind_symbols(
+      (struct rebinding[]){
+
+          {"strcmp", strcmp, (void **)&__libc_strcmp},
+          {"strncmp", strncmp, (void **)&__libc_strncmp},
+          {"strcasecmp", strcasecmp, (void **)&__libc_strcasecmp},
+          {"strncasecmp", strncasecmp, (void **)&__libc_strncasecmp},
+          {"memcmp", memcmp, (void **)&__libc_memcmp},
+          {"bcmp", bcmp, (void **)&__libc_bcmp},
+          {"strstr", strstr, (void **)&__libc_strstr},
+          {"strcasestr", strcasestr, (void **)&__libc_strcasestr},
+          {"memmem", memmem, (void **)&__libc_memmem},
+
+      },
+
+      9);
 #endif
 
 }

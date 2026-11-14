@@ -32,8 +32,8 @@ implied warranty.
  */
 typedef struct procmaps_struct {
 
-  void *        addr_start;  //< start address of the area
-  void *        addr_end;    //< end address
+  void         *addr_start;  //< start address of the area
+  void         *addr_end;    //< end address
   unsigned long length;      //< size of the range
 
   char  perm[5];  //< permissions rwxp
@@ -101,7 +101,7 @@ void _pmparser_split_line(char *buf, char *addr1, char *addr2, char *perm,
 void pmparser_print(procmaps_struct *map, int order);
 
 /**
- * gobal variables
+ * global variables
  */
 // procmaps_struct *g_last_head=NULL;
 // procmaps_struct *g_current=NULL;

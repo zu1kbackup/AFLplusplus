@@ -5,17 +5,19 @@
    Originally written by Michal Zalewski
 
    Now maintained by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
+                        Heiko Eissfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2026 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at:
 
-     http://www.apache.org/licenses/LICENSE-2.0
+     https://www.apache.org/licenses/LICENSE-2.0
+
+   SPDX-License-Identifier: Apache-2.0
 
    Gather some functions common to multiple executables
 
@@ -25,8 +27,18 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include "forkserver.h"
+#ifndef _GNU_SOURCE
+  #define _GNU_SOURCE
+#endif
+#ifndef __USE_GNU
+  #define __USE_GNU
+#endif
+#include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <math.h>
+#include <sys/mman.h>
 
 #include "debug.h"
 #include "alloc-inl.h"
@@ -34,14 +46,12 @@
 #include "common.h"
 
 /* Detect @@ in args. */
-#ifndef __glibc__
-  #include <unistd.h>
-#endif
+#include <unistd.h>
 #include <limits.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 
 u8  be_quiet = 0;
 u8 *doc_path = "";
@@ -51,22 +61,246 @@ u8  last_intr = 0;
   #define AFL_PATH "/usr/local/lib/afl/"
 #endif
 
+void *afl_memmem(const void *haystack, size_t haystacklen, const void *needle,
+                 size_t needlelen) {
+
+  if (unlikely(needlelen > haystacklen)) { return NULL; }
+  if (unlikely(needlelen == 0)) { return (void *)haystack; }
+
+  /* memchr() jumps to the next candidate for the first needle byte */
+  const u8 *h = haystack;
+  const u8 *n = needle;
+  const u8 *last = h + (haystacklen - needlelen);
+
+  while (h <= last) {
+
+    h = memchr(h, n[0], (size_t)(last - h) + 1);
+    if (!h) { return NULL; }
+    if (memcmp(h + 1, n + 1, needlelen - 1) == 0) { return (void *)h; }
+    ++h;
+
+  }
+
+  return NULL;
+
+}
+
+void set_sanitizer_defaults() {
+
+  /* Set sane defaults for ASAN if nothing else is specified. */
+  u8 *have_asan_options = getenv("ASAN_OPTIONS");
+  u8 *have_ubsan_options = getenv("UBSAN_OPTIONS");
+  u8 *have_msan_options = getenv("MSAN_OPTIONS");
+  u8 *have_lsan_options = getenv("LSAN_OPTIONS");
+  u8  have_san_options = 0;
+  u8  default_options[1024] =
+      "detect_odr_violation=0:abort_on_error=1:symbolize=0:"
+      "allocator_may_return_null=1:handle_segv=0:handle_sigbus=0:"
+      "handle_abort=0:handle_sigfpe=0:handle_sigill=0:"
+      "detect_stack_use_after_return=0:check_initialization_order=0:";
+
+  if (have_asan_options || have_ubsan_options || have_msan_options ||
+      have_lsan_options) {
+
+    have_san_options = 1;
+
+  }
+
+  /* LSAN does not support abort_on_error=1. (is this still true??) */
+  u8 should_detect_leaks = 0;
+
+  if (!have_lsan_options) {
+
+    u8 buf[2048] = "";
+    if (!have_san_options) { strcpy(buf, default_options); }
+    if (have_asan_options) {
+
+      if (NULL != strstr(have_asan_options, "detect_leaks=0") ||
+          NULL != strstr(have_asan_options, "detect_leaks=false")) {
+
+        strcat(buf, "exitcode=" STRINGIFY(LSAN_ERROR) ":fast_unwind_on_malloc=0:print_suppressions=0:detect_leaks=0:malloc_context_size=0:");
+
+      } else {
+
+        should_detect_leaks = 1;
+        strcat(buf, "exitcode=" STRINGIFY(LSAN_ERROR) ":fast_unwind_on_malloc=0:print_suppressions=0:detect_leaks=1:malloc_context_size=30:");
+
+      }
+
+    }
+
+    setenv("LSAN_OPTIONS", buf, 1);
+
+  }
+
+  /* Enforce halt_on_error=1 for all sanitizers except LSAN. This is set after
+     the LSAN_OPTIONS buffer is built (LSAN does not want it) but before ASAN,
+     UBSAN and MSAN consume default_options below. It is required for UBSAN,
+     which otherwise just logs and continues instead of aborting on a finding.
+   */
+
+  strcat(default_options, "halt_on_error=1:");
+
+  /* for everything not LSAN we disable detect_leaks */
+
+  if (!have_lsan_options) {
+
+    if (should_detect_leaks) {
+
+      strcat(default_options, "detect_leaks=1:malloc_context_size=30:");
+
+    } else {
+
+      strcat(default_options, "detect_leaks=0:malloc_context_size=0:");
+
+    }
+
+  }
+
+  /* AFL_CRASH_TRACES: symbolize sanitizer reports so captured crash traces are
+     readable, and disable the sanitizer's default coredump suppression
+     (disable_coredump=0) so the kernel still writes a core that can be saved as
+     "<crash>.core". Last-wins parsing makes these override the defaults.
+     Symbolization only runs when a report is printed (on a crash), so this adds
+     nothing to the fuzzing hot path. symbolize=1 is only added to the built-in
+     defaults, but disable_coredump=0 is required for the core file, so it is
+     also appended to a user-supplied ASAN_OPTIONS/UBSAN_OPTIONS (which would
+     otherwise skip the built-in defaults below and never dump a core). */
+
+  {
+
+    u8 *ct = (u8 *)getenv("AFL_CRASH_TRACES");
+    if (ct && atoi((char *)ct)) {
+
+      strcat(default_options, "symbolize=1:disable_coredump=0:");
+
+      if (have_asan_options) {
+
+        u8 buf[2048];
+        snprintf((char *)buf, sizeof(buf), "%s:disable_coredump=0",
+                 (char *)have_asan_options);
+        setenv("ASAN_OPTIONS", (char *)buf, 1);
+
+      }
+
+      if (have_ubsan_options) {
+
+        u8 buf[2048];
+        snprintf((char *)buf, sizeof(buf), "%s:disable_coredump=0",
+                 (char *)have_ubsan_options);
+        setenv("UBSAN_OPTIONS", (char *)buf, 1);
+
+      }
+
+    }
+
+  }
+
+  /* Set sane defaults for ASAN if nothing else is specified. */
+
+  if (!have_san_options) { setenv("ASAN_OPTIONS", default_options, 1); }
+
+  /* Set sane defaults for UBSAN if nothing else is specified. */
+
+  if (!have_san_options) { setenv("UBSAN_OPTIONS", default_options, 1); }
+
+  /* MSAN is tricky, because it doesn't support abort_on_error=1 at this
+     point. So, we do this in a very hacky way. */
+
+  if (!have_msan_options) {
+
+    u8 buf[2048] = "";
+    if (!have_san_options) { strcpy(buf, default_options); }
+    strcat(buf, "exit_code=" STRINGIFY(MSAN_ERROR) ":msan_track_origins=0:");
+    setenv("MSAN_OPTIONS", buf, 1);
+
+  }
+
+  /* Envs for QASan */
+  setenv("QASAN_MAX_CALL_STACK", "0", 0);
+  setenv("QASAN_SYMBOLIZE", "0", 0);
+
+}
+
+u32 check_binary_signatures(u8 *fn) {
+
+  int ret = 0, fd = open(fn, O_RDONLY);
+  if (fd < 0) { PFATAL("Unable to open '%s'", fn); }
+  struct stat st;
+  if (fstat(fd, &st) < 0) { PFATAL("Unable to fstat '%s'", fn); }
+  size_t f_len = st.st_size;
+  u8    *f_data = mmap(0, f_len, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (f_data == MAP_FAILED) { PFATAL("Unable to mmap file '%s'", fn); }
+  close(fd);
+
+  if (afl_memmem(f_data, f_len, PERSIST_SIG, strlen(PERSIST_SIG))) {
+
+    if (!be_quiet) { OKF(cPIN "Persistent mode binary detected."); }
+    setenv(PERSIST_ENV_VAR, "1", 1);
+    ret = 1;
+
+  } else if (getenv("AFL_PERSISTENT")) {
+
+    if (!be_quiet) { OKF(cPIN "Persistent mode enforced."); }
+    setenv(PERSIST_ENV_VAR, "1", 1);
+    ret = 1;
+
+  } else if (getenv("AFL_FRIDA_PERSISTENT_ADDR")) {
+
+    if (!be_quiet) {
+
+      OKF("FRIDA Persistent mode configuration options detected.");
+
+    }
+
+    setenv(PERSIST_ENV_VAR, "1", 1);
+    ret = 1;
+
+  }
+
+  if (afl_memmem(f_data, f_len, DEFER_SIG, strlen(DEFER_SIG))) {
+
+    if (!be_quiet) { OKF(cPIN "Deferred forkserver binary detected."); }
+    setenv(DEFER_ENV_VAR, "1", 1);
+    ret += 2;
+
+  } else if (getenv("AFL_DEFER_FORKSRV")) {
+
+    if (!be_quiet) { OKF(cPIN "Deferred forkserver enforced."); }
+    setenv(DEFER_ENV_VAR, "1", 1);
+    ret += 2;
+
+  }
+
+  if (munmap(f_data, f_len)) { PFATAL("unmap() failed"); }
+
+  return ret;
+
+}
+
 void detect_file_args(char **argv, u8 *prog_in, bool *use_stdin) {
 
   u32 i = 0;
   u8  cwd[PATH_MAX];
   if (getcwd(cwd, (size_t)sizeof(cwd)) == NULL) { PFATAL("getcwd() failed"); }
+  char *placeholder = (char *)get_afl_env("AFL_INPUT_PLACEHOLDER");
+  if (!placeholder || !*placeholder) { placeholder = (char *)"@@"; }
+  size_t placeholder_len = strlen(placeholder);
 
   /* we are working with libc-heap-allocated argvs. So do not mix them with
    * other allocation APIs like ck_alloc. That would disturb the free() calls.
    */
   while (argv[i]) {
 
-    u8 *aa_loc = strstr(argv[i], "@@");
+    char *aa_loc = strstr(argv[i], placeholder);
 
     if (aa_loc) {
 
-      if (!prog_in) { FATAL("@@ syntax is not supported by this tool."); }
+      if (!prog_in) {
+
+        FATAL("%s syntax is not supported by this tool.", placeholder);
+
+      }
 
       *use_stdin = false;
 
@@ -79,11 +313,13 @@ void detect_file_args(char **argv, u8 *prog_in, bool *use_stdin) {
 
       if (prog_in[0] == '/') {
 
-        n_arg = alloc_printf("%s%s%s", argv[i], prog_in, aa_loc + 2);
+        n_arg =
+            alloc_printf("%s%s%s", argv[i], prog_in, aa_loc + placeholder_len);
 
       } else {
 
-        n_arg = alloc_printf("%s%s/%s%s", argv[i], cwd, prog_in, aa_loc + 2);
+        n_arg = alloc_printf("%s%s/%s%s", argv[i], cwd, prog_in,
+                             aa_loc + placeholder_len);
 
       }
 
@@ -140,15 +376,15 @@ void argv_cpy_free(char **argv) {
 
 }
 
-/* Rewrite argv for QEMU. */
+/* Rewrite argv for CoreSight process tracer. */
 
-char **get_qemu_argv(u8 *own_loc, u8 **target_path_p, int argc, char **argv) {
+char **get_cs_argv(u8 *own_loc, u8 **target_path_p, int argc, char **argv) {
 
-  if (unlikely(getenv("AFL_QEMU_CUSTOM_BIN"))) {
+  if (unlikely(getenv("AFL_CS_CUSTOM_BIN"))) {
 
     WARNF(
-        "AFL_QEMU_CUSTOM_BIN is enabled. "
-        "You must run your target under afl-qemu-trace on your own!");
+        "AFL_CS_CUSTOM_BIN is enabled. "
+        "You must run your target under afl-cs-proxy on your own!");
     return argv;
 
   }
@@ -162,9 +398,39 @@ char **get_qemu_argv(u8 *own_loc, u8 **target_path_p, int argc, char **argv) {
   new_argv[2] = *target_path_p;
   new_argv[1] = "--";
 
+  /* Now we need to actually find the cs-proxy binary to put in argv[0]. */
+
+  *target_path_p = new_argv[0] = find_afl_binary(own_loc, "afl-cs-proxy");
+  return new_argv;
+
+}
+
+/* Rewrite argv for QEMU. */
+
+static u8 *find_qemu_binary(u8 *own_loc);
+
+char **get_qemu_argv(u8 *own_loc, u8 **target_path_p, int argc, char **argv) {
+
+  if (unlikely(getenv("AFL_QEMU_CUSTOM_BIN"))) {
+
+    WARNF(
+        "AFL_QEMU_CUSTOM_BIN is enabled. "
+        "You must run your target under afl-qemu-trace on your own!");
+    return argv;
+
+  }
+
+  char **new_argv = ck_alloc(sizeof(char *) * (argc + 3));
+  if (unlikely(!new_argv)) { FATAL("Illegal amount of arguments specified"); }
+
+  memcpy(&new_argv[3], &argv[1], (int)(sizeof(char *)) * (argc - 1));
+
+  new_argv[2] = *target_path_p;
+  new_argv[1] = "--";
+
   /* Now we need to actually find the QEMU binary to put in argv[0]. */
 
-  *target_path_p = new_argv[0] = find_afl_binary(own_loc, "afl-qemu-trace");
+  *target_path_p = new_argv[0] = find_qemu_binary(own_loc);
   return new_argv;
 
 }
@@ -173,11 +439,10 @@ char **get_qemu_argv(u8 *own_loc, u8 **target_path_p, int argc, char **argv) {
 
 char **get_wine_argv(u8 *own_loc, u8 **target_path_p, int argc, char **argv) {
 
-  char **new_argv = ck_alloc(sizeof(char *) * (argc + 3));
+  char **new_argv = ck_alloc(sizeof(char *) * (argc + 2));
   if (unlikely(!new_argv)) { FATAL("Illegal amount of arguments specified"); }
 
   memcpy(&new_argv[2], &argv[1], (int)(sizeof(char *)) * (argc - 1));
-  new_argv[argc + 2] = NULL;
 
   new_argv[1] = *target_path_p;
 
@@ -193,9 +458,7 @@ char **get_wine_argv(u8 *own_loc, u8 **target_path_p, int argc, char **argv) {
 /* Find binary, used by analyze, showmap, tmin
    @returns the path, allocating the string */
 
-u8 *find_binary(u8 *fname) {
-
-  // TODO: Merge this function with check_binary of afl-fuzz-init.c
+static u8 *find_binary_internal(u8 *fname, u8 fatal) {
 
   u8 *env_path = NULL;
   u8 *target_path = NULL;
@@ -212,7 +475,8 @@ u8 *find_binary(u8 *fname) {
         !(st.st_mode & 0111) || st.st_size < 4) {
 
       ck_free(target_path);
-      FATAL("Program '%s' not found or not executable", fname);
+      if (fatal) { FATAL("Program '%s' not found or not executable", fname); }
+      return NULL;
 
     }
 
@@ -229,7 +493,7 @@ u8 *find_binary(u8 *fname) {
 
           FATAL(
               "Unexpected overflow when processing ENV. This should never "
-              "happend.");
+              "had happened.");
 
         }
 
@@ -270,7 +534,8 @@ u8 *find_binary(u8 *fname) {
 
     if (!target_path) {
 
-      FATAL("Program '%s' not found or not executable", fname);
+      if (fatal) { FATAL("Program '%s' not found or not executable", fname); }
+      return NULL;
 
     }
 
@@ -280,7 +545,15 @@ u8 *find_binary(u8 *fname) {
 
 }
 
-u8 *find_afl_binary(u8 *own_loc, u8 *fname) {
+u8 *find_binary(u8 *fname) {
+
+  // TODO: Merge this function with check_binary of afl-fuzz-init.c
+
+  return find_binary_internal(fname, 1);
+
+}
+
+static u8 *find_afl_binary_internal(u8 *own_loc, u8 *fname, u8 fatal) {
 
   u8 *afl_path = NULL, *target_path, *own_copy, *tmp;
   int perm = X_OK;
@@ -358,47 +631,129 @@ u8 *find_afl_binary(u8 *own_loc, u8 *fname) {
 
   if (perm == X_OK) {
 
-    return find_binary(fname);
+    return find_binary_internal(fname, fatal);
 
   } else {
 
-    FATAL("Library '%s' not found", fname);
+    if (fatal) { FATAL("Library '%s' not found", fname); }
+    return NULL;
 
   }
 
 }
 
-/* Parses the kill signal environment variable, FATALs on error.
-  If the env is not set, sets the env to default_signal for the signal handlers
-  and returns the default_signal. */
-int parse_afl_kill_signal_env(u8 *afl_kill_signal_env, int default_signal) {
+u8 *find_afl_binary(u8 *own_loc, u8 *fname) {
 
-  if (afl_kill_signal_env && afl_kill_signal_env[0]) {
+  return find_afl_binary_internal(own_loc, fname, 1);
 
-    char *endptr;
-    u8    signal_code;
-    signal_code = (u8)strtoul(afl_kill_signal_env, &endptr, 10);
-    /* Did we manage to parse the full string? */
-    if (*endptr != '\0' || endptr == (char *)afl_kill_signal_env) {
+}
 
-      FATAL("Invalid AFL_KILL_SIGNAL: %s (expected unsigned int)",
-            afl_kill_signal_env);
+static u8 *find_qemu_binary(u8 *own_loc) {
 
-    }
+  u8 *mode = getenv("AFL_QEMU_MODE");
+  u8 *target_path = NULL;
 
-    return signal_code;
+  if (mode && !strcasecmp(mode, "bridge")) {
+
+    target_path = find_afl_binary(own_loc, "afl-qemu-bridge");
+
+  } else if (mode && (!strcasecmp(mode, "trace") ||
+
+                      !strcasecmp(mode, "qemuafl"))) {
+
+    target_path = find_afl_binary(own_loc, "afl-qemu-trace");
 
   } else {
 
-    char *sigstr = alloc_printf("%d", default_signal);
-    if (!sigstr) { FATAL("Failed to alloc mem for signal buf"); }
+    target_path = find_afl_binary_internal(own_loc, "afl-qemu-trace", 0);
 
-    /* Set the env for signal handler */
-    setenv("AFL_KILL_SIGNAL", sigstr, 1);
-    free(sigstr);
-    return default_signal;
+    if (!target_path) {
+
+      target_path = find_afl_binary(own_loc, "afl-qemu-bridge");
+
+    }
 
   }
+
+  if (!be_quiet) {
+
+    char *full = realpath(target_path, NULL);
+    OKF("Using QEMU binary: %s", full ? full : (char *)target_path);
+    if (full) { free(full); }
+
+  }
+
+  return target_path;
+
+}
+
+int parse_afl_kill_signal(u8 *numeric_signal_as_str, int default_signal) {
+
+  if (numeric_signal_as_str && numeric_signal_as_str[0]) {
+
+    char *endptr;
+    u8    signal_code;
+    signal_code = (u8)strtoul(numeric_signal_as_str, &endptr, 10);
+    /* Did we manage to parse the full string? */
+    if (*endptr != '\0' || endptr == (char *)numeric_signal_as_str) {
+
+      FATAL("Invalid signal name: %s", numeric_signal_as_str);
+
+    } else {
+
+      return signal_code;
+
+    }
+
+  }
+
+  return default_signal;
+
+}
+
+void configure_afl_kill_signals(afl_forkserver_t *fsrv,
+                                char             *afl_kill_signal_env,
+                                char             *afl_fsrv_kill_signal_env,
+                                int               default_server_kill_signal) {
+
+  afl_kill_signal_env =
+      afl_kill_signal_env ? afl_kill_signal_env : getenv("AFL_KILL_SIGNAL");
+  afl_fsrv_kill_signal_env = afl_fsrv_kill_signal_env
+                                 ? afl_fsrv_kill_signal_env
+                                 : getenv("AFL_FORK_SERVER_KILL_SIGNAL");
+
+  fsrv->child_kill_signal = parse_afl_kill_signal(afl_kill_signal_env, SIGKILL);
+
+  if (afl_kill_signal_env && !afl_fsrv_kill_signal_env) {
+
+    /*
+    Set AFL_FORK_SERVER_KILL_SIGNAL to the value of AFL_KILL_SIGNAL for
+    backwards compatibility. However, if AFL_FORK_SERVER_KILL_SIGNAL is set, is
+    takes precedence.
+    */
+    afl_fsrv_kill_signal_env = afl_kill_signal_env;
+
+  }
+
+  fsrv->fsrv_kill_signal = parse_afl_kill_signal(afl_fsrv_kill_signal_env,
+                                                 default_server_kill_signal);
+
+}
+
+void configure_afl_crash_exitcode(afl_forkserver_t *fsrv, const char *value) {
+
+  if (!value) { return; }
+
+  char *end;
+  long  exitcode = strtol(value, &end, 10);
+  if (end == value || *end || exitcode < -127 || exitcode > 128) {
+
+    FATAL("Invalid crash exitcode, expected -127 to 128, but got %s", value);
+
+  }
+
+  fsrv->uses_crash_exitcode = true;
+  fsrv->crash_exitcode = (u8)exitcode;    /* WEXITSTATUS is 8 bit unsigned. */
 
 }
 
@@ -470,9 +825,9 @@ void print_suggested_envs(char *mispelled_env) {
 
   for (j = 0; afl_environment_variables[j] != NULL; ++j) {
 
-    char * afl_env = afl_environment_variables[j] + 4;
+    char  *afl_env = afl_environment_variables[j] + 4;
     size_t afl_env_len = strlen(afl_env);
-    char * reduced = ck_alloc(afl_env_len + 1);
+    char  *reduced = ck_alloc(afl_env_len + 1);
 
     size_t start = 0;
     while (start < afl_env_len) {
@@ -510,7 +865,7 @@ void print_suggested_envs(char *mispelled_env) {
 
   if (found) goto cleanup;
 
-  char * reduced = ck_alloc(env_name_len + 1);
+  char  *reduced = ck_alloc(env_name_len + 1);
   size_t start = 0;
   while (start < env_name_len) {
 
@@ -600,7 +955,21 @@ void check_environment_vars(char **envp) {
 
           WARNF("AFL environment variable %s is deprecated!",
                 afl_environment_deprecated[i]);
-          issue_detected = 1;
+
+          if (strncmp(afl_environment_deprecated[i], "AFL_SAN_NO_INST",
+                      strlen(afl_environment_deprecated[i])) == 0) {
+
+            WARNF(
+                "AFL_LLVM_ONLY_FSRV/AFL_GCC_ONLY_FSRV is induced and set "
+                "instead.");
+            setenv("AFL_GCC_ONLY_FSRV", "1", 0);
+            setenv("AFL_LLVM_ONLY_FSRV", "1", 0);
+
+          } else {
+
+            issue_detected = 1;
+
+          }
 
         } else {
 
@@ -631,17 +1000,23 @@ char *get_afl_env(char *env) {
 
   char *val;
 
-  if ((val = getenv(env)) != NULL) {
+  if ((val = getenv(env))) {
 
-    if (!be_quiet) {
+    if (*val) {
 
-      OKF("Loaded environment variable %s with value %s", env, val);
+      if (!be_quiet) {
+
+        OKF("Enabled environment variable %s with value %s", env, val);
+
+      }
+
+      return val;
 
     }
 
   }
 
-  return val;
+  return NULL;
 
 }
 
@@ -721,10 +1096,7 @@ bool extract_and_set_env(u8 *env_str) {
     *rest = '\0';  // done with variable value
 
     rest += 1;
-    if (rest < end && *rest != ' ') { goto free_and_return; }
-
     num_pairs++;
-
     setenv(key, val, 1);
 
   }
@@ -753,27 +1125,31 @@ void read_bitmap(u8 *fname, u8 *map, size_t len) {
 
 /* Get unix time in milliseconds */
 
-u64 get_cur_time(void) {
+inline u64 get_cur_time(void) {
 
-  struct timeval  tv;
-  struct timezone tz;
+  struct timespec ts;
 
-  gettimeofday(&tv, &tz);
+  // only CLOCK_REALTIME is safe here: MONOTONIC breaks the wall-clock
+  // comparisons, and any _COARSE clock is too low-resolution and wrecks
+  // fuzzing effectiveness by collapsing the per-exec timing
+  clock_gettime(CLOCK_REALTIME, &ts);
 
-  return (tv.tv_sec * 1000ULL) + (tv.tv_usec / 1000);
+  return (ts.tv_sec * 1000ULL) + (ts.tv_nsec / 1000000);
 
 }
 
 /* Get unix time in microseconds */
 
-u64 get_cur_time_us(void) {
+inline u64 get_cur_time_us(void) {
 
-  struct timeval  tv;
-  struct timezone tz;
+  struct timespec ts;
 
-  gettimeofday(&tv, &tz);
+  // only CLOCK_REALTIME is safe here: MONOTONIC breaks the wall-clock
+  // comparisons, and any _COARSE clock is too low-resolution and wrecks
+  // fuzzing effectiveness by collapsing the per-exec timing
+  clock_gettime(CLOCK_REALTIME, &ts);
 
-  return (tv.tv_sec * 1000000ULL) + tv.tv_usec;
+  return (ts.tv_sec * 1000000ULL) + (ts.tv_nsec / 1000);
 
 }
 
@@ -782,7 +1158,7 @@ u64 get_cur_time_us(void) {
    Will return buf for convenience. */
 
 u8 *stringify_int(u8 *buf, size_t len, u64 val) {
-\
+
 #define CHK_FORMAT(_divisor, _limit_mult, _fmt, _cast)     \
   do {                                                     \
                                                            \
@@ -946,7 +1322,7 @@ u8 *stringify_time_diff(u8 *buf, size_t len, u64 cur_ms, u64 event_ms) {
    Will return buf for convenience. */
 
 u8 *u_stringify_int(u8 *buf, u64 val) {
-\
+
 #define CHK_FORMAT(_divisor, _limit_mult, _fmt, _cast) \
   do {                                                 \
                                                        \
@@ -1102,21 +1478,59 @@ u8 *u_stringify_time_diff(u8 *buf, u64 cur_ms, u64 event_ms) {
 
 }
 
+/* Unsafe describe time delta as simple string.
+   Returns a pointer to buf for convenience. */
+
+u8 *u_simplestring_time_diff(u8 *buf, u64 cur_ms, u64 event_ms) {
+
+  if (!event_ms) {
+
+    sprintf(buf, "00:00:00");
+
+  } else {
+
+    u64 delta;
+    s32 t_d, t_h, t_m, t_s;
+
+    delta = cur_ms - event_ms;
+
+    t_d = delta / 1000 / 60 / 60 / 24;
+    t_h = (delta / 1000 / 60 / 60) % 24;
+    t_m = (delta / 1000 / 60) % 60;
+    t_s = (delta / 1000) % 60;
+
+    sprintf(buf, "%d:%02d:%02d:%02d", t_d, t_h, t_m, t_s);
+
+  }
+
+  return buf;
+
+}
+
+/* Validate map size, returns validated size or FATALs if invalid */
+u32 validate_map_size(u32 map_size) {
+
+  if (!map_size || map_size >= (1U << 29)) {
+
+    FATAL("illegal AFL_MAP_SIZE %u, must be between 64 <= %u < %u", map_size,
+          64U, 1U << 29);
+
+  }
+
+  return map_size;
+
+}
+
 /* Reads the map size from ENV */
 u32 get_map_size(void) {
 
   uint32_t map_size = DEFAULT_SHMEM_SIZE;
-  char *   ptr;
+  char    *ptr;
 
   if ((ptr = getenv("AFL_MAP_SIZE")) || (ptr = getenv("AFL_MAPSIZE"))) {
 
     map_size = atoi(ptr);
-    if (!map_size || map_size > (1 << 29)) {
-
-      FATAL("illegal AFL_MAP_SIZE %u, must be between %u and %u", map_size, 64U,
-            1U << 29);
-
-    }
+    validate_map_size(map_size);
 
     if (map_size % 64) { map_size = (((map_size >> 6) + 1) << 6); }
 
@@ -1132,12 +1546,12 @@ u32 get_map_size(void) {
 
 /* Create a stream file */
 
-FILE *create_ffile(u8 *fn) {
+FILE *create_ffile(u8 *fn, mode_t mode) {
 
   s32   fd;
   FILE *f;
 
-  fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, DEFAULT_PERMISSION);
+  fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, mode);
 
   if (fd < 0) { PFATAL("Unable to create '%s'", fn); }
 
@@ -1151,15 +1565,64 @@ FILE *create_ffile(u8 *fn) {
 
 /* Create a file */
 
-s32 create_file(u8 *fn) {
+s32 create_file(u8 *fn, mode_t mode) {
 
   s32 fd;
 
-  fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, DEFAULT_PERMISSION);
+  fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, mode);
 
   if (fd < 0) { PFATAL("Unable to create '%s'", fn); }
 
   return fd;
 
 }
+
+#ifdef __linux__
+
+/* Nyx requires a tmp workdir to access specific files (such as mmapped files,
+ * etc.). This helper function basically creates both a path to a tmp workdir
+ * and the workdir itself. If the environment variable TMPDIR is set, we use
+ * that as the base directory, otherwise we use /tmp. */
+char *create_nyx_tmp_workdir(void) {
+
+  char *tmpdir = getenv("TMPDIR");
+
+  if (!tmpdir) { tmpdir = "/tmp"; }
+
+  char *nyx_out_dir_path =
+      alloc_printf("%s/.nyx_tmp_%d/", tmpdir, (u32)getpid());
+
+  if (mkdir(nyx_out_dir_path, 0700)) { PFATAL("Unable to create nyx workdir"); }
+
+  return nyx_out_dir_path;
+
+}
+
+/* Vice versa, we remove the tmp workdir for nyx with this helper function. */
+void remove_nyx_tmp_workdir(afl_forkserver_t *fsrv, char *nyx_out_dir_path) {
+
+  char *workdir_path = alloc_printf("%s/workdir", nyx_out_dir_path);
+
+  if (access(workdir_path, R_OK) == 0) {
+
+    if (fsrv->nyx_handlers->nyx_remove_work_dir(workdir_path) != true) {
+
+      WARNF("Unable to remove nyx workdir (%s)", workdir_path);
+
+    }
+
+  }
+
+  if (rmdir(nyx_out_dir_path)) {
+
+    WARNF("Unable to remove nyx workdir (%s)", nyx_out_dir_path);
+
+  }
+
+  ck_free(workdir_path);
+  ck_free(nyx_out_dir_path);
+
+}
+
+#endif
 

@@ -22,12 +22,18 @@ CFLAGS      ?= -O3 -funroll-loops -D_FORTIFY_SOURCE=2
 override CFLAGS += -I ../../include/ -Wall -g -Wno-pointer-sign
 
 CFLAGS_ADD=$(USEHUGEPAGE:1=-DUSEHUGEPAGE)
-CFLAGS += $(CFLAGS_ADD)
+CFLAGS_ADD += $(USENAMEDPAGE:1=-DUSENAMEDPAGE)
+override CFLAGS += $(CFLAGS_ADD)
+
+SRCS = libdislocator.so.c
+ifeq ($(shell uname), Darwin)
+	SRCS += ../macos_fishhook/fishhook.c
+endif
 
 all: libdislocator.so
 
-libdislocator.so: libdislocator.so.c ../../config.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -shared -fPIC libdislocator.so.c -o $@ $(LDFLAGS)
+libdislocator.so: $(SRCS) ../../config.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -shared -fPIC $(SRCS) -o $@ $(LDFLAGS)
 	cp -fv libdislocator.so ../../
 
 .NOTPARALLEL: clean
@@ -40,4 +46,3 @@ install: all
 	install -m 755 -d $${DESTDIR}$(HELPER_PATH)
 	install -m 755 ../../libdislocator.so $${DESTDIR}$(HELPER_PATH)
 	install -m 644 -T README.md $${DESTDIR}$(HELPER_PATH)/README.dislocator.md
-

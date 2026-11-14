@@ -1,14 +1,11 @@
 #include <errno.h>
-#include <sys/shm.h>
-#include <sys/mman.h>
 
 #include "frida-gumjs.h"
-
-#include "debug.h"
 
 #include "entry.h"
 #include "intercept.h"
 #include "prefetch.h"
+#include "shm.h"
 #include "stalker.h"
 #include "util.h"
 
@@ -21,7 +18,7 @@
 typedef struct {
 
   size_t count;
-  void * entry[PREFETCH_ENTRIES];
+  void  *entry[PREFETCH_ENTRIES];
 
   guint8 backpatch_data[BP_SIZE];
   gsize  backpatch_size;
@@ -32,7 +29,8 @@ gboolean prefetch_enable = TRUE;
 gboolean prefetch_backpatch = TRUE;
 
 static prefetch_data_t *prefetch_data = NULL;
-static int              prefetch_shm_id = -1;
+
+static GHashTable *cant_prefetch = NULL;
 
 static void gum_afl_stalker_backpatcher_notify(GumStalkerObserver *self,
                                                const GumBackpatch *backpatch,
@@ -42,15 +40,31 @@ static void gum_afl_stalker_backpatcher_notify(GumStalkerObserver *self,
   if (!entry_run) { return; }
   gsize remaining =
       sizeof(prefetch_data->backpatch_data) - prefetch_data->backpatch_size;
+
+  gpointer from = gum_stalker_backpatch_get_from(backpatch);
+  gpointer to = gum_stalker_backpatch_get_to(backpatch);
+
+  /* Stop reporting patches which can't be prefetched */
+  if (g_hash_table_contains(cant_prefetch, GSIZE_TO_POINTER(from)) ||
+      g_hash_table_contains(cant_prefetch, GSIZE_TO_POINTER(to))) {
+
+    return;
+
+  }
+
   if (sizeof(gsize) + size > remaining) { return; }
 
-  *(gsize *)(&prefetch_data->backpatch_data[prefetch_data->backpatch_size]) =
-      size;
-  prefetch_data->backpatch_size += sizeof(gsize);
-
-  memcpy(&prefetch_data->backpatch_data[prefetch_data->backpatch_size],
-         backpatch, size);
-  prefetch_data->backpatch_size += size;
+  /* AFL may SIGKILL this child (timeout) at any instruction.
+   * Publish the entry with one store to backpatch_size after its header and
+   * data are written; growing the size before the data left a torn entry,
+   * and the parent's prefetch_read_patches() then FFATALs before the next
+   * fork, which kills the whole lane. */
+  guint8 *dst = &prefetch_data->backpatch_data[prefetch_data->backpatch_size];
+  memcpy(dst, &size, sizeof(gsize));
+  memcpy(dst + sizeof(gsize), backpatch, size);
+  __atomic_store_n(&prefetch_data->backpatch_size,
+                   prefetch_data->backpatch_size + sizeof(gsize) + size,
+                   __ATOMIC_RELEASE);
 
 }
 
@@ -69,6 +83,9 @@ void prefetch_write(void *addr) {
   /* Bail if we aren't initialized */
   if (prefetch_data == NULL) return;
 
+  /* Stop reporting blocks which can't be prefetched */
+  if (g_hash_table_contains(cant_prefetch, GSIZE_TO_POINTER(addr))) { return; }
+
   /*
    * Our shared memory IPC is large enough for about 1000 entries, we can fine
    * tune this if we need to. But if we have more new blocks that this in a
@@ -85,6 +102,91 @@ void prefetch_write(void *addr) {
 
 }
 
+/* the parent checks every block and backpatch address a child
+ * reports.  Enumerating the process ranges for each address cost seconds per
+ * fork on iOS, where target code sits in the shared cache behind thousands of
+ * ranges.  Keep a sorted copy of the executable ranges across forks and search
+ * it by bisection.  The fork server parent's map hardly changes once it is
+ * running, so the copy is refreshed only when an address misses it, at most
+ * once per prefetch_read(), which still catches mappings made since. */
+static GArray  *prefetch_exec_ranges = NULL;
+static gboolean prefetch_ranges_fresh = FALSE;
+
+static gboolean prefetch_collect_range(const GumRangeDetails *details,
+                                       gpointer               user_data) {
+
+  UNUSED_PARAMETER(user_data);
+  g_array_append_val(prefetch_exec_ranges, *details->range);
+  return TRUE;
+
+}
+
+static gint prefetch_range_sort(gconstpointer a, gconstpointer b) {
+
+  const GumMemoryRange *ra = (const GumMemoryRange *)a;
+  const GumMemoryRange *rb = (const GumMemoryRange *)b;
+  if (ra->base_address < rb->base_address) return -1;
+  if (ra->base_address > rb->base_address) return 1;
+  return 0;
+
+}
+
+static void prefetch_refresh_ranges(void) {
+
+  if (prefetch_exec_ranges == NULL) {
+
+    prefetch_exec_ranges = g_array_new(FALSE, FALSE, sizeof(GumMemoryRange));
+
+  }
+
+  g_array_set_size(prefetch_exec_ranges, 0);
+  gum_process_enumerate_ranges(GUM_PAGE_EXECUTE, prefetch_collect_range, NULL);
+  g_array_sort(prefetch_exec_ranges, prefetch_range_sort);
+  prefetch_ranges_fresh = TRUE;
+
+}
+
+static gboolean prefetch_ranges_contain(GumAddress target) {
+
+  gsize lo = 0;
+  gsize hi = prefetch_exec_ranges->len;
+  while (lo < hi) {
+
+    gsize                 mid = lo + (hi - lo) / 2;
+    const GumMemoryRange *range =
+        &g_array_index(prefetch_exec_ranges, GumMemoryRange, mid);
+    if (target < range->base_address) {
+
+      hi = mid;
+
+    } else if (target >= range->base_address + range->size) {
+
+      lo = mid + 1;
+
+    } else {
+
+      return TRUE;
+
+    }
+
+  }
+
+  return FALSE;
+
+}
+
+static gboolean prefetch_is_executable(void *address) {
+
+  GumAddress target = GUM_ADDRESS(address);
+  if (prefetch_exec_ranges == NULL) { prefetch_refresh_ranges(); }
+  if (prefetch_ranges_contain(target)) { return TRUE; }
+  if (prefetch_ranges_fresh) { return FALSE; }
+
+  prefetch_refresh_ranges();
+  return prefetch_ranges_contain(target);
+
+}
+
 static void prefetch_read_blocks(void) {
 
   GumStalker *stalker = stalker_get();
@@ -93,7 +195,24 @@ static void prefetch_read_blocks(void) {
   for (size_t i = 0; i < prefetch_data->count; i++) {
 
     void *addr = prefetch_data->entry[i];
-    gum_stalker_prefetch(stalker, addr, 1);
+
+    if (prefetch_is_executable(addr)) {
+
+      gum_stalker_prefetch(stalker, addr, 1);
+
+    } else {
+
+      /*
+       * If our child process creates a new executable mapping, e.g. by
+       * dynamically loading a new DSO, then this won't appear in our parent
+       * process' memory map and hence we can't prefetch it. Add it to a
+       * hashtable which the child will inherit on the next fork to prevent the
+       * child from keep reporting it and exhausting the shared memory buffers
+       * used to pass new blocks from the child back to the parent.
+       */
+      g_hash_table_add(cant_prefetch, GSIZE_TO_POINTER(addr));
+
+    }
 
   }
 
@@ -108,24 +227,54 @@ static void prefetch_read_blocks(void) {
 static void prefetch_read_patches(void) {
 
   gsize         offset = 0;
-  GumStalker *  stalker = stalker_get();
+  GumStalker   *stalker = stalker_get();
   GumBackpatch *backpatch = NULL;
 
   for (gsize remaining = prefetch_data->backpatch_size - offset;
        remaining > sizeof(gsize);
        remaining = prefetch_data->backpatch_size - offset) {
 
-    gsize size = *(gsize *)(&prefetch_data->backpatch_data[offset]);
+    gsize *src_backpatch_data = (gsize *)&prefetch_data->backpatch_data[offset];
+    gsize  size = *src_backpatch_data;
     offset += sizeof(gsize);
 
     if (prefetch_data->backpatch_size - offset < size) {
 
-      FATAL("Incomplete backpatch entry");
+      FFATAL("Incomplete backpatch entry");
 
     }
 
     backpatch = (GumBackpatch *)&prefetch_data->backpatch_data[offset];
-    gum_stalker_prefetch_backpatch(stalker, backpatch);
+
+    gpointer from = gum_stalker_backpatch_get_from(backpatch);
+    gpointer to = gum_stalker_backpatch_get_to(backpatch);
+
+    /*
+     * If our child process creates a new executable mapping, e.g. by
+     * dynamically loading a new DSO, then this won't appear in our parent
+     * process' memory map and hence we can't prefetch it. Add it to a
+     * hashtable which the child will inherit on the next fork to prevent the
+     * child from keep reporting it and exhausting the shared memory buffers
+     * used to pass new blocks from the child back to the parent.
+     */
+    if (!prefetch_is_executable(from)) {
+
+      g_hash_table_add(cant_prefetch, GSIZE_TO_POINTER(from));
+
+    }
+
+    if (!prefetch_is_executable(to)) {
+
+      g_hash_table_add(cant_prefetch, GSIZE_TO_POINTER(to));
+
+    }
+
+    if (prefetch_is_executable(from) && prefetch_is_executable(to)) {
+
+      gum_stalker_prefetch_backpatch(stalker, backpatch);
+
+    }
+
     offset += size;
 
   }
@@ -138,6 +287,22 @@ static void prefetch_read_patches(void) {
  * Read the IPC region one block at the time and prefetch it
  */
 void prefetch_read(void) {
+
+  prefetch_ranges_fresh = FALSE;
+
+  /*
+   * Only the fork server keeps the cached ranges: it no longer runs target
+   * code, so its executable mappings are never removed. A process past the
+   * entry point (a test case child, or a process the target forks itself)
+   * reaches this through the fork hook with a copy it inherited, and may have
+   * unmapped code since. List the ranges afresh there before trusting a hit.
+   */
+  if (entry_run && prefetch_data != NULL &&
+      (prefetch_data->count != 0 || prefetch_data->backpatch_size != 0)) {
+
+    prefetch_refresh_ranges();
+
+  }
 
   prefetch_read_blocks();
   prefetch_read_patches();
@@ -171,16 +336,18 @@ static int prefetch_on_fork(void) {
 static void prefetch_hook_fork(void) {
 
   void *fork_addr =
-      GSIZE_TO_POINTER(gum_module_find_export_by_name(NULL, "fork"));
+      GSIZE_TO_POINTER(gum_module_find_global_export_by_name("fork"));
   intercept_hook(fork_addr, prefetch_on_fork, NULL);
 
 }
 
 void prefetch_init(void) {
 
-  OKF("Instrumentation - prefetch [%c]", prefetch_enable ? 'X' : ' ');
-  OKF("Instrumentation - prefetch_backpatch [%c]",
-      prefetch_backpatch ? 'X' : ' ');
+  FOKF(cBLU "Instrumentation" cRST " - " cGRN "prefetch:" cYEL " [%c]",
+       prefetch_enable ? 'X' : ' ');
+  FOKF(cBLU "Instrumentation" cRST " - " cGRN "prefetch_backpatch:" cYEL
+            " [%c]",
+       prefetch_backpatch ? 'X' : ' ');
 
   if (!prefetch_enable) { return; }
   /*
@@ -188,34 +355,20 @@ void prefetch_init(void) {
    * with the coverage bitmap region and fork will take care of ensuring both
    * the parent and child see the same consistent memory region.
    */
-  prefetch_shm_id =
-      shmget(IPC_PRIVATE, sizeof(prefetch_data_t), IPC_CREAT | IPC_EXCL | 0600);
-  if (prefetch_shm_id < 0) {
-
-    FATAL("prefetch_shm_id < 0 - errno: %d\n", errno);
-
-  }
-
-  prefetch_data = shmat(prefetch_shm_id, NULL, 0);
-  g_assert(prefetch_data != MAP_FAILED);
-
-  /*
-   * Configure the shared memory region to be removed once the process dies.
-   */
-  if (shmctl(prefetch_shm_id, IPC_RMID, NULL) < 0) {
-
-    FATAL("shmctl (IPC_RMID) < 0 - errno: %d\n", errno);
-
-  }
-
-  /* Clear it, not sure it's necessary, just seems like good practice */
-  memset(prefetch_data, '\0', sizeof(prefetch_data_t));
+  prefetch_data = shm_create(sizeof(prefetch_data_t));
 
   prefetch_hook_fork();
 
+  cant_prefetch = g_hash_table_new(g_direct_hash, g_direct_equal);
+  if (cant_prefetch == NULL) {
+
+    FFATAL("Failed to g_hash_table_new, errno: %d", errno);
+
+  }
+
   if (!prefetch_backpatch) { return; }
 
-  GumStalkerObserver *         observer = stalker_get_observer();
+  GumStalkerObserver          *observer = stalker_get_observer();
   GumStalkerObserverInterface *iface = GUM_STALKER_OBSERVER_GET_IFACE(observer);
   iface->notify_backpatch = gum_afl_stalker_backpatcher_notify;
 

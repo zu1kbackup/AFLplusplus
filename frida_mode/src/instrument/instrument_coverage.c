@@ -5,12 +5,11 @@
 
 #include "frida-gumjs.h"
 
-#include "debug.h"
-
 #include "instrument.h"
 #include "util.h"
 
 char *instrument_coverage_filename = NULL;
+bool  instrument_coverage_absolute = false;
 
 static int normal_coverage_fd = -1;
 static int normal_coverage_pipes[2] = {-1, -1};
@@ -19,7 +18,7 @@ static int unstable_coverage_fd = -1;
 static int unstable_coverage_pipes[2] = {-1, -1};
 
 static uint64_t normal_coverage_last_start = 0;
-static gchar *  unstable_coverage_fuzzer_stats = NULL;
+static gchar   *unstable_coverage_fuzzer_stats = NULL;
 
 typedef struct {
 
@@ -70,7 +69,7 @@ typedef struct {
 static gboolean coverage_range(const GumRangeDetails *details,
                                gpointer               user_data) {
 
-  GArray *         coverage_ranges = (GArray *)user_data;
+  GArray          *coverage_ranges = (GArray *)user_data;
   coverage_range_t coverage = {0};
 
   if (details->file == NULL) { return TRUE; }
@@ -212,8 +211,8 @@ static GArray *coverage_get_modules(void) {
 static void instrument_coverage_mark(void *key, void *value, void *user_data) {
 
   UNUSED_PARAMETER(key);
-  coverage_mark_ctx_t *   ctx = (coverage_mark_ctx_t *)user_data;
-  GArray *                coverage_modules = ctx->modules;
+  coverage_mark_ctx_t    *ctx = (coverage_mark_ctx_t *)user_data;
+  GArray                 *coverage_modules = ctx->modules;
   normal_coverage_data_t *val = (normal_coverage_data_t *)value;
   guint                   i;
 
@@ -239,7 +238,19 @@ static void instrument_coverage_mark(void *key, void *value, void *user_data) {
 
 }
 
-static void coverage_write(void *data, size_t size) {
+static void instrument_coverage_mark_first(void *key, void *value,
+                                           void *user_data) {
+
+  UNUSED_PARAMETER(key);
+  coverage_range_t       *module = (coverage_range_t *)user_data;
+  normal_coverage_data_t *val = (normal_coverage_data_t *)value;
+
+  val->module = module;
+  module->count++;
+
+}
+
+static void coverage_write(int fd, void *data, size_t size) {
 
   ssize_t written;
   size_t  remain = size;
@@ -247,11 +258,11 @@ static void coverage_write(void *data, size_t size) {
   for (char *cursor = (char *)data; remain > 0;
        remain -= written, cursor += written) {
 
-    written = write(normal_coverage_fd, cursor, remain);
+    written = write(fd, cursor, remain);
 
     if (written < 0) {
 
-      FATAL("Coverage - Failed to write: %s (%d)\n", (char *)data, errno);
+      FFATAL("Coverage - Failed to write: %s (%d)\n", (char *)data, errno);
 
     }
 
@@ -259,7 +270,7 @@ static void coverage_write(void *data, size_t size) {
 
 }
 
-static void coverage_format(char *format, ...) {
+static void coverage_format(int fd, char *format, ...) {
 
   va_list ap;
   char    buffer[4096] = {0};
@@ -274,11 +285,11 @@ static void coverage_format(char *format, ...) {
 
   len = strnlen(buffer, sizeof(buffer));
 
-  coverage_write(buffer, len);
+  coverage_write(fd, buffer, len);
 
 }
 
-static void coverage_write_modules(GArray *coverage_modules) {
+static void coverage_write_modules(int fd, GArray *coverage_modules) {
 
   guint emitted = 0;
   for (guint i = 0; i < coverage_modules->len; i++) {
@@ -287,16 +298,16 @@ static void coverage_write_modules(GArray *coverage_modules) {
         &g_array_index(coverage_modules, coverage_range_t, i);
     if (module->count == 0) continue;
 
-    coverage_format("%3u, ", emitted);
-    coverage_format("%016" G_GINT64_MODIFIER "X, ", module->base_address);
-    coverage_format("%016" G_GINT64_MODIFIER "X, ", module->limit);
+    coverage_format(fd, "%3u, ", emitted);
+    coverage_format(fd, "%016" G_GINT64_MODIFIER "X, ", module->base_address);
+    coverage_format(fd, "%016" G_GINT64_MODIFIER "X, ", module->limit);
     /* entry */
-    coverage_format("%016" G_GINT64_MODIFIER "X, ", 0);
+    coverage_format(fd, "%016" G_GINT64_MODIFIER "X, ", 0UL);
     /* checksum */
-    coverage_format("%016" G_GINT64_MODIFIER "X, ", 0);
+    coverage_format(fd, "%016" G_GINT64_MODIFIER "X, ", 0UL);
     /* timestamp */
-    coverage_format("%08" G_GINT32_MODIFIER "X, ", 0);
-    coverage_format("%s\n", module->path);
+    coverage_format(fd, "%08" G_GINT32_MODIFIER "X, ", 0);
+    coverage_format(fd, "%s\n", module->path);
     emitted++;
 
   }
@@ -306,7 +317,7 @@ static void coverage_write_modules(GArray *coverage_modules) {
 static void coverage_write_events(void *key, void *value, void *user_data) {
 
   UNUSED_PARAMETER(key);
-  UNUSED_PARAMETER(user_data);
+  int                     fd = *((int *)user_data);
   normal_coverage_data_t *val = (normal_coverage_data_t *)value;
 
   if (val->module == NULL) { return; }
@@ -319,20 +330,26 @@ static void coverage_write_events(void *key, void *value, void *user_data) {
 
   };
 
-  coverage_write(&evt, sizeof(coverage_event_t));
+#if (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+  evt.offset = __builtin_bswap32(evt.offset);
+  evt.length = __builtin_bswap16(evt.length);
+  evt.module = __builtin_bswap16(evt.module);
+#endif
+
+  coverage_write(fd, &evt, sizeof(coverage_event_t));
 
 }
 
-static void coverage_write_header(guint coverage_marked_modules) {
+static void coverage_write_header(int fd, guint coverage_marked_modules) {
 
   char version[] = "DRCOV VERSION: 2\n";
   char flavour[] = "DRCOV FLAVOR: frida\n";
   char columns[] = "Columns: id, base, end, entry, checksum, timestamp, path\n";
-  coverage_write(version, sizeof(version) - 1);
-  coverage_write(flavour, sizeof(flavour) - 1);
-  coverage_format("Module Table: version 2, count %u\n",
+  coverage_write(fd, version, sizeof(version) - 1);
+  coverage_write(fd, flavour, sizeof(flavour) - 1);
+  coverage_format(fd, "Module Table: version 2, count %u\n",
                   coverage_marked_modules);
-  coverage_write(columns, sizeof(columns) - 1);
+  coverage_write(fd, columns, sizeof(columns) - 1);
 
 }
 
@@ -371,7 +388,7 @@ static void instrument_coverage_normal_run() {
 
   if (close(normal_coverage_pipes[STDOUT_FILENO]) != 0) {
 
-    FATAL("Failed to close parent read pipe");
+    FFATAL("Failed to close parent read pipe");
 
   }
 
@@ -379,7 +396,7 @@ static void instrument_coverage_normal_run() {
       g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
   if (coverage_hash == NULL) {
 
-    FATAL("Failed to g_hash_table_new, errno: %d", errno);
+    FFATAL("Failed to g_hash_table_new, errno: %d", errno);
 
   }
 
@@ -396,54 +413,79 @@ static void instrument_coverage_normal_run() {
 
   }
 
-  if (bytes != 0) { FATAL("Coverage data truncated"); }
+  if (bytes != 0) { FFATAL("Coverage data truncated"); }
 
   instrument_coverage_print("Coverage - Preparing\n");
 
-  GArray *coverage_modules = coverage_get_modules();
+  if (instrument_coverage_absolute) {
 
-  guint size = g_hash_table_size(coverage_hash);
-  instrument_coverage_print("Coverage - Total Entries: %u\n", size);
+    guint size = g_hash_table_size(coverage_hash);
+    instrument_coverage_print("Coverage - Total Entries: %u\n", size);
 
-  coverage_mark_ctx_t ctx = {.modules = coverage_modules, .count = 0};
+    coverage_range_t module = {
 
-  g_hash_table_foreach(coverage_hash, instrument_coverage_mark, &ctx);
-  instrument_coverage_print("Coverage - Marked Entries: %u\n", ctx.count);
+        .base_address = GUM_ADDRESS(0),
+        .limit = GUM_ADDRESS(-1),
+        .size = GUM_ADDRESS(-1),
+        .path = "absolute",
+        .offset = 0,
+        .is_executable = true,
+        .count = size,
+        .id = 0,
 
-  guint coverage_marked_modules = coverage_mark_modules(coverage_modules);
-  instrument_coverage_print("Coverage - Marked Modules: %u\n",
-                            coverage_marked_modules);
+    };
 
-  coverage_write_header(coverage_marked_modules);
-  coverage_write_modules(coverage_modules);
-  coverage_format("BB Table: %u bbs\n", ctx.count);
-  g_hash_table_foreach(coverage_hash, coverage_write_events, NULL);
+    instrument_coverage_print("Coverage Module - 0x%016" G_GINT64_MODIFIER
+                              "X - 0x%016" G_GINT64_MODIFIER "X (%s)\n",
+                              module.base_address, module.limit, module.path);
+
+    GArray *coverage_modules =
+        g_array_sized_new(false, false, sizeof(coverage_range_t), 1);
+    g_array_append_val(coverage_modules, module);
+
+    g_hash_table_foreach(coverage_hash, instrument_coverage_mark_first,
+                         &module);
+
+    coverage_write_header(normal_coverage_fd, 1);
+    coverage_write_modules(normal_coverage_fd, coverage_modules);
+    coverage_format(normal_coverage_fd, "BB Table: %u bbs\n", size);
+    g_hash_table_foreach(coverage_hash, coverage_write_events,
+                         &normal_coverage_fd);
+
+  } else {
+
+    GArray *coverage_modules = coverage_get_modules();
+
+    guint size = g_hash_table_size(coverage_hash);
+    instrument_coverage_print("Coverage - Total Entries: %u\n", size);
+
+    coverage_mark_ctx_t ctx = {.modules = coverage_modules, .count = 0};
+
+    /* For each coverage event in the hashtable associate it with a module and
+     * count the number of entries per module */
+    g_hash_table_foreach(coverage_hash, instrument_coverage_mark, &ctx);
+    instrument_coverage_print("Coverage - Marked Entries: %u\n", ctx.count);
+
+    /* For each module with coverage events assign it an incrementing number */
+    guint coverage_marked_modules = coverage_mark_modules(coverage_modules);
+    instrument_coverage_print("Coverage - Marked Modules: %u\n",
+                              coverage_marked_modules);
+
+    coverage_write_header(normal_coverage_fd, coverage_marked_modules);
+    coverage_write_modules(normal_coverage_fd, coverage_modules);
+    coverage_format(normal_coverage_fd, "BB Table: %u bbs\n", ctx.count);
+    g_hash_table_foreach(coverage_hash, coverage_write_events,
+                         &normal_coverage_fd);
+
+  }
 
   g_hash_table_unref(coverage_hash);
-
   instrument_coverage_print("Coverage - Completed\n");
 
 }
 
-static GArray *instrument_coverage_unstable_read_unstable_ids(void) {
-
-  gchar * contents = NULL;
-  gsize   length = 0;
-  GArray *unstable_edge_ids =
-      g_array_sized_new(false, false, sizeof(gpointer), 100);
-
-  if (!g_file_get_contents(unstable_coverage_fuzzer_stats, &contents, &length,
-                           NULL)) {
-
-    FATAL("Failed to read fuzzer_stats");
-
-  }
-
-  instrument_coverage_print("\n");
-  instrument_coverage_print("Unstable coverage stats:\n");
-  instrument_coverage_print("========================\n");
-  instrument_coverage_print("%s\n", contents);
-  instrument_coverage_print("\n");
+static gchar **instrument_coverage_unstable_parse_var_bytes(
+    const gchar *contents) {
 
   gchar **lines = g_strsplit(contents, "\n", -1);
   gchar **values = NULL;
@@ -481,12 +523,55 @@ static GArray *instrument_coverage_unstable_read_unstable_ids(void) {
 
   }
 
-  if (values == NULL) {
+  g_strfreev(lines);
+  return values;
 
-    instrument_coverage_print(
-        "Failed to find var_bytes, did you set AFL_DEBUG?\n");
+}
+
+static GArray *instrument_coverage_unstable_read_unstable_ids(void) {
+
+  gchar   *contents = NULL;
+  gchar  **values = NULL;
+  gsize    length = 0;
+  gboolean stats_read = false;
+  GArray  *unstable_edge_ids =
+      g_array_sized_new(false, false, sizeof(gpointer), 100);
+
+  /*
+   * The coverage helper starts before afl-fuzz is guaranteed to have created
+   * and populated fuzzer_stats. Wait for both the file and var_bytes so the
+   * result does not depend on startup ordering.
+   */
+  for (guint attempt = 0; attempt < 1000 && values == NULL; attempt++) {
+
+    g_free(contents);
+    contents = NULL;
+
+    if (g_file_get_contents(unstable_coverage_fuzzer_stats, &contents, &length,
+                            NULL)) {
+
+      stats_read = true;
+      values = instrument_coverage_unstable_parse_var_bytes(contents);
+
+    }
+
+    if (values == NULL && attempt != 999) { g_usleep(10000); }
 
   }
+
+  if (values == NULL) {
+
+    if (!stats_read) { FFATAL("Failed to read fuzzer_stats"); }
+
+    FFATAL("Failed to find var_bytes in fuzzer_stats, did you set AFL_DEBUG?");
+
+  }
+
+  instrument_coverage_print("\n");
+  instrument_coverage_print("Unstable coverage stats:\n");
+  instrument_coverage_print("========================\n");
+  instrument_coverage_print("%s\n", contents);
+  instrument_coverage_print("\n");
 
   for (guint i = 0; values[i] != NULL; i++) {
 
@@ -497,7 +582,6 @@ static GArray *instrument_coverage_unstable_read_unstable_ids(void) {
   }
 
   g_strfreev(values);
-  g_strfreev(lines);
   g_free(contents);
 
   for (guint i = 0; i < unstable_edge_ids->len; i++) {
@@ -526,7 +610,7 @@ static GHashTable *instrument_collect_unstable_blocks(
     GHashTable *child =
         (GHashTable *)g_hash_table_lookup(unstable_coverage_hash, *id);
 
-    if (child == NULL) { FATAL("Failed to find edge ID"); }
+    if (child == NULL) { FFATAL("Failed to find edge ID"); }
 
     GHashTableIter iter = {0};
     gpointer       value;
@@ -534,7 +618,7 @@ static GHashTable *instrument_collect_unstable_blocks(
     while (g_hash_table_iter_next(&iter, NULL, &value)) {
 
       unstable_coverage_data_t *unstable = (unstable_coverage_data_t *)value;
-      normal_coverage_data_t *  from =
+      normal_coverage_data_t   *from =
           gum_malloc0(sizeof(normal_coverage_data_t));
       normal_coverage_data_t *to = gum_malloc0(sizeof(normal_coverage_data_t));
       from->start = unstable->from;
@@ -565,7 +649,7 @@ static void instrument_coverage_unstable_run(void) {
 
   if (close(unstable_coverage_pipes[STDOUT_FILENO]) != 0) {
 
-    FATAL("Failed to close parent read pipe");
+    FFATAL("Failed to close parent read pipe");
 
   }
 
@@ -573,7 +657,7 @@ static void instrument_coverage_unstable_run(void) {
       g_direct_hash, g_direct_equal, NULL, (GDestroyNotify)g_hash_table_unref);
   if (unstable_coverage_hash == NULL) {
 
-    FATAL("Failed to g_hash_table_new, errno: %d", errno);
+    FFATAL("Failed to g_hash_table_new, errno: %d", errno);
 
   }
 
@@ -599,7 +683,7 @@ static void instrument_coverage_unstable_run(void) {
       if (!g_hash_table_insert(unstable_coverage_hash,
                                GSIZE_TO_POINTER(value->edge), hash_value)) {
 
-        FATAL("Entry already in hashtable");
+        FFATAL("Entry already in hashtable");
 
       }
 
@@ -613,11 +697,9 @@ static void instrument_coverage_unstable_run(void) {
 
   }
 
-  if (bytes != 0) { FATAL("Unstable coverage data truncated"); }
+  if (bytes != 0) { FFATAL("Unstable coverage data truncated"); }
 
   instrument_coverage_print("Coverage - Preparing\n");
-
-  GArray *coverage_modules = coverage_get_modules();
 
   instrument_coverage_print("Found edges: %u\n", edges);
 
@@ -629,19 +711,60 @@ static void instrument_coverage_unstable_run(void) {
   guint size = g_hash_table_size(unstable_blocks);
   instrument_coverage_print("Unstable blocks: %u\n", size);
 
-  coverage_mark_ctx_t ctx = {.modules = coverage_modules, .count = 0};
+  if (instrument_coverage_absolute) {
 
-  g_hash_table_foreach(unstable_blocks, instrument_coverage_mark, &ctx);
-  instrument_coverage_print("Coverage - Marked Entries: %u\n", ctx.count);
+    instrument_coverage_print("Coverage - Total Entries: %u\n", size);
 
-  guint coverage_marked_modules = coverage_mark_modules(coverage_modules);
-  instrument_coverage_print("Coverage - Marked Modules: %u\n",
-                            coverage_marked_modules);
+    coverage_range_t module = {
 
-  coverage_write_header(coverage_marked_modules);
-  coverage_write_modules(coverage_modules);
-  coverage_format("BB Table: %u bbs\n", ctx.count);
-  g_hash_table_foreach(unstable_blocks, coverage_write_events, NULL);
+        .base_address = GUM_ADDRESS(0),
+        .limit = GUM_ADDRESS(-1),
+        .size = GUM_ADDRESS(-1),
+        .path = "absolute",
+        .offset = 0,
+        .is_executable = true,
+        .count = size,
+        .id = 0,
+
+    };
+
+    instrument_coverage_print("Coverage Module - 0x%016" G_GINT64_MODIFIER
+                              "X - 0x%016" G_GINT64_MODIFIER "X (%s)\n",
+                              module.base_address, module.limit, module.path);
+
+    GArray *coverage_modules =
+        g_array_sized_new(false, false, sizeof(coverage_range_t), 1);
+    g_array_append_val(coverage_modules, module);
+
+    g_hash_table_foreach(unstable_blocks, instrument_coverage_mark_first,
+                         &module);
+
+    coverage_write_header(unstable_coverage_fd, 1);
+    coverage_write_modules(unstable_coverage_fd, coverage_modules);
+    coverage_format(unstable_coverage_fd, "BB Table: %u bbs\n", size);
+    g_hash_table_foreach(unstable_blocks, coverage_write_events,
+                         &unstable_coverage_fd);
+
+  } else {
+
+    GArray *coverage_modules = coverage_get_modules();
+
+    coverage_mark_ctx_t ctx = {.modules = coverage_modules, .count = 0};
+
+    g_hash_table_foreach(unstable_blocks, instrument_coverage_mark, &ctx);
+    instrument_coverage_print("Coverage - Marked Entries: %u\n", ctx.count);
+
+    guint coverage_marked_modules = coverage_mark_modules(coverage_modules);
+    instrument_coverage_print("Coverage - Marked Modules: %u\n",
+                              coverage_marked_modules);
+
+    coverage_write_header(unstable_coverage_fd, coverage_marked_modules);
+    coverage_write_modules(unstable_coverage_fd, coverage_modules);
+    coverage_format(unstable_coverage_fd, "BB Table: %u bbs\n", ctx.count);
+    g_hash_table_foreach(unstable_blocks, coverage_write_events,
+                         &unstable_coverage_fd);
+
+  }
 
   g_hash_table_unref(unstable_blocks);
   g_array_free(unstable_edge_ids, TRUE);
@@ -654,38 +777,40 @@ static void instrument_coverage_unstable_run(void) {
 void instrument_coverage_config(void) {
 
   instrument_coverage_filename = getenv("AFL_FRIDA_INST_COVERAGE_FILE");
+  instrument_coverage_absolute =
+      (getenv("AFL_FRIDA_INST_COVERAGE_ABSOLUTE") != NULL);
 
 }
 
 void instrument_coverage_normal_init(void) {
 
-  OKF("Coverage - enabled [%c]",
-      instrument_coverage_filename == NULL ? ' ' : 'X');
+  FOKF(cBLU "Instrumentation" cRST " - " cGRN "coverage:" cYEL " [%s]",
+       instrument_coverage_filename == NULL ? " "
+                                            : instrument_coverage_filename);
 
   if (instrument_coverage_filename == NULL) { return; }
-
-  OKF("Coverage - file [%s]", instrument_coverage_filename);
 
   char *path = g_canonicalize_filename(instrument_coverage_filename,
                                        g_get_current_dir());
 
-  OKF("Coverage - path [%s]", path);
+  FOKF(cBLU "Instrumentation" cRST " - " cGRN "coverage path:" cYEL " [%s]",
+       path);
 
   normal_coverage_fd = open(path, O_RDWR | O_CREAT | O_TRUNC,
                             S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
   if (normal_coverage_fd < 0) {
 
-    FATAL("Failed to open coverage file '%s'", path);
+    FFATAL("Failed to open coverage file '%s'", path);
 
   }
 
   g_free(path);
 
-  if (pipe(normal_coverage_pipes) != 0) { FATAL("Failed to create pipes"); }
+  if (pipe(normal_coverage_pipes) != 0) { FFATAL("Failed to create pipes"); }
 
   pid_t pid = fork();
-  if (pid == -1) { FATAL("Failed to start coverage process"); }
+  if (pid == -1) { FFATAL("Failed to start coverage process"); }
 
   if (pid == 0) {
 
@@ -697,13 +822,13 @@ void instrument_coverage_normal_init(void) {
 
   if (close(normal_coverage_fd) < 0) {
 
-    FATAL("Failed to close coverage output file");
+    FFATAL("Failed to close coverage output file");
 
   }
 
   if (close(normal_coverage_pipes[STDIN_FILENO]) != 0) {
 
-    FATAL("Failed to close parent read pipe");
+    FFATAL("Failed to close parent read pipe");
 
   }
 
@@ -711,15 +836,17 @@ void instrument_coverage_normal_init(void) {
 
 void instrument_coverage_unstable_find_output(void) {
 
-  pid_t  parent = getpid();
   gchar *fds_name = g_strdup_printf("/proc/%d/fd/", getppid());
 
   gchar *root = g_file_read_link("/proc/self/root", NULL);
-  if (root == NULL) { FATAL("Failed to read link"); }
+  if (root == NULL) { FFATAL("Failed to read link"); }
 
   GDir *dir = g_dir_open(fds_name, 0, NULL);
 
-  OKF("Coverage Unstable - fds: %s", fds_name);
+  gchar *path_tmp = getenv("AFL_CUSTOM_INFO_OUT");
+  gchar *instance_name = g_path_get_basename(path_tmp);
+
+  FVERBOSE("Coverage Unstable - fds: %s", fds_name);
 
   for (const gchar *filename = g_dir_read_name(dir); filename != NULL;
        filename = g_dir_read_name(dir)) {
@@ -727,10 +854,10 @@ void instrument_coverage_unstable_find_output(void) {
     gchar *fullname = g_build_path("/", fds_name, filename, NULL);
 
     gchar *link = g_file_read_link(fullname, NULL);
-    if (link == NULL) { FATAL("Failed to read link: %s", fullname); }
+    if (link == NULL) { FFATAL("Failed to read link: %s", fullname); }
 
     gchar *basename = g_path_get_basename(link);
-    if (g_strcmp0(basename, "default") != 0) {
+    if (g_strcmp0(basename, instance_name) != 0) {
 
       g_free(basename);
       g_free(link);
@@ -775,33 +902,40 @@ void instrument_coverage_unstable_find_output(void) {
   }
 
   g_dir_close(dir);
+  g_free(instance_name);
   g_free(fds_name);
 
   if (unstable_coverage_fuzzer_stats == NULL) {
 
-    FATAL("Failed to find fuzzer stats");
+    FFATAL("Failed to find fuzzer stats");
 
   }
 
-  OKF("Fuzzer stats: %s", unstable_coverage_fuzzer_stats);
+  FVERBOSE("Fuzzer stats: %s", unstable_coverage_fuzzer_stats);
 
 }
 
 void instrument_coverage_unstable_init(void) {
 
+  FOKF(cBLU "Instrumentation" cRST " - " cGRN "unstable coverage:" cYEL " [%s]",
+       instrument_coverage_unstable_filename == NULL
+           ? " "
+           : instrument_coverage_unstable_filename);
   if (instrument_coverage_unstable_filename == NULL) { return; }
 
   char *path = g_canonicalize_filename(instrument_coverage_unstable_filename,
                                        g_get_current_dir());
 
-  OKF("Coverage - unstable path [%s]", instrument_coverage_unstable_filename);
+  FOKF(cBLU "Instrumentation" cRST " - " cGRN "unstable coverage path:" cYEL
+            " [%s]",
+       path == NULL ? " " : path);
 
   unstable_coverage_fd = open(path, O_RDWR | O_CREAT | O_TRUNC,
                               S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
   if (unstable_coverage_fd < 0) {
 
-    FATAL("Failed to open unstable coverage file '%s'", path);
+    FFATAL("Failed to open unstable coverage file '%s'", path);
 
   }
 
@@ -811,12 +945,12 @@ void instrument_coverage_unstable_init(void) {
 
   if (pipe(unstable_coverage_pipes) != 0) {
 
-    FATAL("Failed to create unstable pipes");
+    FFATAL("Failed to create unstable pipes");
 
   }
 
   pid_t pid = fork();
-  if (pid == -1) { FATAL("Failed to start coverage process"); }
+  if (pid == -1) { FFATAL("Failed to start coverage process"); }
 
   if (pid == 0) {
 
@@ -828,13 +962,13 @@ void instrument_coverage_unstable_init(void) {
 
   if (close(unstable_coverage_fd) < 0) {
 
-    FATAL("Failed to close unstable coverage output file");
+    FFATAL("Failed to close unstable coverage output file");
 
   }
 
   if (close(unstable_coverage_pipes[STDIN_FILENO]) != 0) {
 
-    FATAL("Failed to close parent read pipe");
+    FFATAL("Failed to close parent read pipe");
 
   }
 
@@ -866,7 +1000,7 @@ void instrument_coverage_end(uint64_t address) {
   if (write(normal_coverage_pipes[STDOUT_FILENO], &data,
             sizeof(normal_coverage_data_t)) != sizeof(normal_coverage_data_t)) {
 
-    FATAL("Coverage I/O error");
+    FFATAL("Coverage I/O error");
 
   }
 
@@ -889,7 +1023,7 @@ void instrument_coverage_unstable(guint64 edge, guint64 previous_rip,
             sizeof(unstable_coverage_data_t)) !=
       sizeof(unstable_coverage_data_t)) {
 
-    FATAL("Unstable coverage I/O error");
+    FFATAL("Unstable coverage I/O error");
 
   }
 

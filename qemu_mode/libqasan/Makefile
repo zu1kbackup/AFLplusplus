@@ -4,7 +4,7 @@
 #
 # Written by Andrea Fioraldi <andreafioraldi@gmail.com>
 #
-# Copyright 2019-2020 Andrea Fioraldi. All rights reserved.
+# Copyright 2019-2024 Andrea Fioraldi. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,6 +23,13 @@ VERSION     = $(shell grep '^\#define VERSION ' ../config.h | cut -d '"' -f2)
 CFLAGS      += -I ../qemuafl/qemuafl/
 CFLAGS      += -Wno-int-to-void-pointer-cast -ggdb
 LDFLAGS     += -ldl -pthread
+
+QASAN_FILE_COMPLETE := $(shell printf '%s\n' \
+  'int qasan_file_size(void) { return sizeof(*(FILE *)0); }' | \
+  $(CC) $(CFLAGS) -include stdio.h -x c -c -o /dev/null - >/dev/null 2>&1 && echo 1)
+ifeq ($(QASAN_FILE_COMPLETE),1)
+CFLAGS      += -DQASAN_HAVE_COMPLETE_FILE
+endif
 
 SRC := libqasan.c hooks.c malloc.c string.c uninstrument.c patch.c dlmalloc.c
 HDR := libqasan.h
